@@ -20,6 +20,18 @@ from typing import Optional
 
 import streamlit as st
 
+try:
+    import docx  # noqa: F401  # package name: python-docx
+    import openpyxl  # noqa: F401
+except ModuleNotFoundError as e:
+    st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
+    st.error(
+        f"Missing dependency: {e}. Streamlit Cloud installs packages from **requirements.txt** "
+        "at the repository root (needs `python-docx` and `openpyxl`). Commit that file, reboot the app, "
+        "and check **Manage app → Logs** for pip errors."
+    )
+    st.stop()
+
 from promptpath_exec_report_v1 import (
     LISTENED_LINE_TYPE_OPTIONS,
     ReportConfig,
@@ -32,7 +44,15 @@ from promptpath_exec_report_v1 import (
 )
 
 _APP_DIR = Path(__file__).resolve().parent
-_DEFAULT_LOGO = _APP_DIR / "Promptpath_Logo.png"
+
+
+def _default_logo_path() -> Optional[Path]:
+    """Linux (Streamlit Cloud) is case-sensitive; repo file is PromptPath_Logo.png."""
+    for name in ("PromptPath_Logo.png", "Promptpath_Logo.png"):
+        p = _APP_DIR / name
+        if p.is_file():
+            return p
+    return None
 
 
 def _collect_allowed_passwords() -> tuple[str, ...]:
@@ -119,11 +139,12 @@ def _logo_path_from_upload(uploaded: Optional[object], tmpdir: str) -> str:
         with open(p, "wb") as f:
             f.write(uploaded.getvalue())
         return p
-    if _DEFAULT_LOGO.is_file():
-        return str(_DEFAULT_LOGO)
+    plogo = _default_logo_path()
+    if plogo is not None:
+        return str(plogo)
     raise FileNotFoundError(
-        "No logo uploaded and Promptpath_Logo.png was not found beside this app. "
-        "Upload a PNG logo or place Promptpath_Logo.png in the project folder."
+        "No logo uploaded and PromptPath_Logo.png was not found beside this app. "
+        "Place PromptPath_Logo.png in the project folder."
     )
 
 

@@ -56,7 +56,7 @@ PERIOD_END = "2025-04-28"
 IB_CSV_PATH = "inbound.csv"
 OB_CSV_PATH = "outbound.csv"
 DEPT_CSV_PATH = "dept_calls.csv"
-LOGO_PATH = "Promptpath_Logo.png"
+LOGO_PATH = "PromptPath_Logo.png"
 OUTPUT_PATH = "PromptPath_Report.docx"
 
 IB_ONLY = False
