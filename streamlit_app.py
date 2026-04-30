@@ -133,12 +133,10 @@ def main() -> None:
         "a companion number audit Excel file (_audit.xlsx) with raw CSV figures (All Dealers vs sum of dealers)."
     )
 
-    if "docx_bytes" not in st.session_state:
-        st.session_state.docx_bytes = None
-        st.session_state.docx_name = None
-    if "audit_bytes" not in st.session_state:
-        st.session_state.audit_bytes = None
-        st.session_state.audit_name = None
+    st.session_state.setdefault("docx_bytes", None)
+    st.session_state.setdefault("docx_name", None)
+    st.session_state.setdefault("audit_bytes", None)
+    st.session_state.setdefault("audit_name", None)
 
     with st.form("report_form"):
         group_name = st.text_input("Dealer group name", value="Example Automotive Group")
