@@ -8,10 +8,12 @@ Run locally:
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import secrets as secrets_stdlib
 import tempfile
+import zipfile
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,7 @@ import streamlit as st
 from promptpath_exec_report_v1 import (
     LISTENED_LINE_TYPE_OPTIONS,
     ReportConfig,
+    generate_dealer_reports,
     generate_report,
     normalize_store_filters,
     validate_dept_csv,
@@ -138,6 +141,8 @@ def main() -> None:
     st.session_state.setdefault("docx_name", None)
     st.session_state.setdefault("audit_bytes", None)
     st.session_state.setdefault("audit_name", None)
+    st.session_state.setdefault("dealer_zip_bytes", None)
+    st.session_state.setdefault("dealer_zip_name", None)
 
     with st.form("report_form"):
         group_name = st.text_input("Dealer group name", value="Example Automotive Group")
@@ -202,6 +207,13 @@ def main() -> None:
                 data=st.session_state.audit_bytes,
                 file_name=st.session_state.audit_name or "PromptPath_Report_audit.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        if st.session_state.dealer_zip_bytes:
+            st.download_button(
+                label="Download last individual dealer reports (ZIP)",
+                data=st.session_state.dealer_zip_bytes,
+                file_name=st.session_state.dealer_zip_name or "PromptPath_Report_individual_dealers.zip",
+                mime="application/zip",
             )
         return
 
@@ -274,6 +286,9 @@ def main() -> None:
         listened_lines=listened_lines,
     )
 
+    st.session_state.dealer_zip_bytes = None
+    st.session_state.dealer_zip_name = None
+
     try:
         generate_report(cfg)
     except FileNotFoundError as e:
@@ -282,6 +297,20 @@ def main() -> None:
     except Exception as e:
         st.exception(e)
         return
+
+    dealer_dir = os.path.join(tmpdir, "dealers")
+    dealer_paths: list[str] = []
+    try:
+        dealer_paths = generate_dealer_reports(cfg, dealer_dir)
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in dealer_paths:
+                zf.write(p, arcname=os.path.basename(p))
+        zip_buf.seek(0)
+        st.session_state.dealer_zip_bytes = zip_buf.read()
+        st.session_state.dealer_zip_name = f"{Path(out_fn).stem}_individual_dealers.zip"
+    except Exception as e:
+        st.warning(f"Individual dealer reports could not be generated: {e}")
 
     audit_name = Path(out_fn).stem + "_audit.xlsx"
     audit_path = os.path.join(tmpdir, audit_name)
@@ -302,7 +331,13 @@ def main() -> None:
     else:
         st.success(f"Generated: {out_fn}")
         st.warning("Number audit workbook was not created (check that openpyxl is installed).")
-    c1, c2 = st.columns(2)
+    nzip = bool(st.session_state.dealer_zip_bytes)
+    if nzip:
+        st.info(
+            f"Individual dealer reports: ZIP with {len(dealer_paths)} store file(s) "
+            f"({st.session_state.dealer_zip_name})."
+        )
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.download_button(
             label="Download DOCX",
@@ -319,6 +354,15 @@ def main() -> None:
                 file_name=st.session_state.audit_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_audit",
+            )
+    with c3:
+        if st.session_state.dealer_zip_bytes:
+            st.download_button(
+                label="Download individual dealers (ZIP)",
+                data=st.session_state.dealer_zip_bytes,
+                file_name=st.session_state.dealer_zip_name,
+                mime="application/zip",
+                key="dl_dealers",
             )
 
 

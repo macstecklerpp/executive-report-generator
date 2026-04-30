@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import csv
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -1032,6 +1032,91 @@ def generate_report(config: ReportConfig) -> str:
         ob_opportunities_column=ob_opp_col,
     )
     return config.output_path
+
+
+def _filtered_sorted_store_names(config: ReportConfig) -> List[str]:
+    """Same dealer ordering as generate_report (filters + sort by current inbound calls)."""
+    ib_only = config.ib_only
+    with open(config.ib_csv_path, newline="", encoding="utf-8") as f:
+        ib = list(csv.DictReader(f))
+
+    inbound_soft_col = bool(ib and ib[0] is not None and "Soft Appt" in ib[0])
+    _ib_fields = list(ib[0].keys()) if ib else []
+    ib_opp_col = _first_matching_col(_ib_fields, IB_UNIQUE_OPP_COLUMNS) or "Connected"
+
+    dd: Dict[str, Dict[str, Any]] = {}
+    for row in ib:
+        dn = row["Dealerships"].strip()
+        pe = row["Period"].strip()
+        if dn == "All Dealers":
+            continue
+        if dn not in dd:
+            dd[dn] = {}
+        d = dd[dn]
+        px = "curr_" if pe == "Current" else "prev_"
+        tot = si(row["Total Appts"])
+        hard = si(row["Hard Appt"])
+        if inbound_soft_col:
+            raw_s = str(row.get("Soft Appt", "")).strip()
+            soft = si(raw_s) if raw_s != "" else max(0, tot - hard)
+        else:
+            soft = max(0, tot - hard)
+        d[px + "ib_calls"] = si(row["Inbound Calls"])
+        d[px + "connected"] = si(row["Connected"])
+        d[px + "ib_unique_opps"] = si(row[ib_opp_col])
+        d[px + "total_appts"] = tot
+        d[px + "hard_appts"] = hard
+        d[px + "soft_appts"] = soft
+        d[px + "delighted"] = si(row["Delighted"])
+        d[px + "disappointed"] = si(row["Disappointed"])
+
+    if not ib_only:
+        if not config.ob_csv_path:
+            raise ValueError("Outbound CSV path is required when ib_only is False.")
+        with open(config.ob_csv_path, newline="", encoding="utf-8") as f:
+            ob = list(csv.DictReader(f))
+        _ob_fields = list(ob[0].keys()) if ob else []
+        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or "Connected"
+        for row in ob:
+            dn = row["Dealerships"].strip()
+            pe = row["Period"].strip()
+            if dn == "All Dealers":
+                continue
+            if dn not in dd:
+                dd[dn] = {}
+            d = dd[dn]
+            px = "curr_" if pe == "Current" else "prev_"
+            h_ob = si(row["Hard Appt"])
+            s_ob = si(row["Soft Appt"])
+            d[px + "ob_dials"] = si(row["Outbound Dials"])
+            d[px + "ob_connected"] = si(row["Connected"])
+            d[px + "ob_unique_opps"] = si(row[ob_opp_col])
+            d[px + "ob_total_appts"] = h_ob + s_ob
+            d[px + "ob_hard_appts"] = h_ob
+            d[px + "ob_soft_appts"] = s_ob
+
+    sf = normalize_store_filters(config.store_filter)
+    sn = [s for s in dd if store_matches_filters(s, sf)]
+    sn.sort(key=lambda s: dd[s].get("curr_ib_calls", 0), reverse=True)
+    return sn
+
+
+def generate_dealer_reports(config: ReportConfig, output_dir: str) -> List[str]:
+    """Generate one full exec-style DOCX per dealer in config's filtered store list.
+
+    Writes companion *_audit.xlsx next to each DOCX via generate_report.
+    Returns paths in the same order as the executive report store list.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    dealers = _filtered_sorted_store_names(config)
+    paths: List[str] = []
+    for dealer in dealers:
+        safe = re.sub(r"[^A-Za-z0-9_\- ]", "_", dealer).strip() or "dealer"
+        out_path = str(Path(output_dir) / f"{safe}.docx")
+        dealer_cfg = replace(config, store_filter=dealer, output_path=out_path)
+        generate_report(dealer_cfg)
+        paths.append(out_path)
+    return paths
 
 
 def _main_cli():
