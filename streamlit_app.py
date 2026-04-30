@@ -177,11 +177,6 @@ def main() -> None:
             type=["csv", "tsv", "txt"],
         )
 
-        logo_up = st.file_uploader(
-            'Logo PNG (optional if Promptpath_Logo.png is in the app folder)',
-            type=["png"],
-        )
-
         submitted = st.form_submit_button("Generate DOCX")
 
     if not submitted:
@@ -250,7 +245,7 @@ def main() -> None:
             return
 
     try:
-        logo_path = _logo_path_from_upload(logo_up, tmpdir)
+        logo_path = _logo_path_from_upload(None, tmpdir)
     except FileNotFoundError as e:
         st.error(str(e))
         return
