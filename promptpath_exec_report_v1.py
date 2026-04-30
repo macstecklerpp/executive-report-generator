@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import csv
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -124,6 +124,31 @@ class ReportConfig:
     ib_only: bool = False
     # None = all stores. Otherwise OR-match: include store if name contains any substring.
     store_filter: Union[None, str, List[str]] = None
+    # UI-selected line types for the listener sentence under Calls Processed by Department.
+    listened_lines: List[str] = field(default_factory=list)
+
+
+# Canonical labels for Streamlit multiselect and DOCX sentence (single source of truth).
+LISTENED_LINE_TYPE_OPTIONS: tuple[str, ...] = (
+    "Sales lines",
+    "Operator lines",
+    "Desk lines",
+    "Service lines",
+    "Parts lines",
+)
+
+
+def _lines_sentence(lines: Sequence[str]) -> str:
+    known = set(LISTENED_LINE_TYPE_OPTIONS)
+    sel = [x for x in lines if x in known]
+    if not sel or set(sel) >= known:
+        return "PromptPath currently listens to all your lines."
+    labels = [x.lower() for x in sel]
+    if len(labels) == 1:
+        phrase = labels[0]
+    else:
+        phrase = ", ".join(labels[:-1]) + ", and " + labels[-1]
+    return f"PromptPath currently listens to your {phrase}."
 
 
 def normalize_store_filters(value: Union[None, str, Sequence[str]]) -> Optional[List[str]]:
@@ -968,6 +993,10 @@ def generate_report(config: ReportConfig) -> str:
 
     make_header(doc)
     section_heading(doc, "Calls Processed by Department", sb=12)
+    p_lines = doc.add_paragraph()
+    p_lines.paragraph_format.space_before = Pt(0)
+    p_lines.paragraph_format.space_after = Pt(6)
+    add_run(p_lines, _lines_sentence(config.listened_lines), italic=True, size=9, color=MID_GRAY)
     make_dept_table(doc)
     kgp(doc)
     section_heading(doc, "Store Sales Performance Summaries", sb=14)

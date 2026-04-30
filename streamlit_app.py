@@ -19,6 +19,7 @@ from typing import Optional
 import streamlit as st
 
 from promptpath_exec_report_v1 import (
+    LISTENED_LINE_TYPE_OPTIONS,
     ReportConfig,
     generate_report,
     normalize_store_filters,
@@ -177,6 +178,13 @@ def main() -> None:
             type=["csv", "tsv", "txt"],
         )
 
+        listened_lines = st.multiselect(
+            "Lines PromptPath currently listens to",
+            options=list(LISTENED_LINE_TYPE_OPTIONS),
+            default=list(LISTENED_LINE_TYPE_OPTIONS),
+            help="Select all line types that apply. All selected = \"all your lines\" in the report.",
+        )
+
         submitted = st.form_submit_button("Generate DOCX")
 
     if not submitted:
@@ -263,6 +271,7 @@ def main() -> None:
         output_path=out_path,
         ib_only=ib_only,
         store_filter=store_filter,
+        listened_lines=listened_lines,
     )
 
     try:
