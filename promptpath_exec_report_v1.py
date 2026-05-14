@@ -24,8 +24,9 @@
   - IB_ONLY=True suppresses all outbound metrics and the Sales Dials column.
   - STORE_FILTER limits to stores whose name contains any of the given substrings (or None).
   - Dealer names in the dept file must match the Dealerships column in the CSV.
-  - Opportunities and appointment set rates share the same denominator: unique-customer columns when present
-    (see IB_UNIQUE_OPP_COLUMNS / OB_UNIQUE_OPP_COLUMNS); otherwise Connected. Connect rate still uses Connected ÷ Dials.
+  - Inbound Opportunities and IB appointment set rate use the unique-customer column when present
+    (see IB_UNIQUE_OPP_COLUMNS); otherwise Connected. Outbound Opportunities use OB_UNIQUE_OPP_COLUMNS similarly.
+    OB appointment set rate divides outbound appointments by outbound Connected. Connect rate uses Connected ÷ Dials.
   - Optional inbound CSV column Soft Appt for hard-percent denominator; otherwise Soft = Total Appts minus Hard Appt.
 ================================================================================
 """
@@ -689,11 +690,11 @@ def generate_report(config: ReportConfig) -> str:
             ),
         )
         or_ = build(
-            lambda d: pct_appt_rate(d.get("curr_ob_total_appts", 0), d.get("curr_ob_unique_opps", 0)),
-            lambda d: pct_appt_rate(d.get("prev_ob_total_appts", 0), d.get("prev_ob_unique_opps", 0))
-            if d.get("prev_ob_unique_opps")
+            lambda d: pct_appt_rate(d.get("curr_ob_total_appts", 0), d.get("curr_ob_connected", 0)),
+            lambda d: pct_appt_rate(d.get("prev_ob_total_appts", 0), d.get("prev_ob_connected", 0))
+            if d.get("prev_ob_connected")
             else None,
-            lambda d, p: f"{pct_appt_rate(d.get(p + 'ob_total_appts', 0), d.get(p + 'ob_unique_opps', 0))}%",
+            lambda d, p: f"{pct_appt_rate(d.get(p + 'ob_total_appts', 0), d.get(p + 'ob_connected', 0))}%",
         )
         ob_b = [
             ("Connect Rate", ocr, "outbound"),
@@ -919,14 +920,14 @@ def generate_report(config: ReportConfig) -> str:
         style_cell(row.cells[2], LIGHT_BLUE, BORDER_GRAY)
         cell_para(row.cells[2], ia_, bold=True, size=10, color=GREEN if ic_ > 0 else (RED if ic_ < 0 else MID_GRAY))
         if not ib_only:
-            ou = oc_d.get("ob_unique_opps", 0)
+            ou = oc_d.get("ob_connected", 0)
             ota = oc_d.get("ob_total_appts", 0)
             otr = pct_appt_rate(ota, ou)
-            opr = pct_appt_rate(op_d.get("ob_total_appts", 0), op_d.get("ob_unique_opps", 0))
+            opr = pct_appt_rate(op_d.get("ob_total_appts", 0), op_d.get("ob_connected", 0))
             oc_ = round(otr - opr, 1)
             oa_ = f"{'▲' if oc_ > 0 else '▼' if oc_ < 0 else '—'} {'+' if oc_ > 0 else ''}{oc_}pp" if oc_ != 0 else "—"
             row = t.rows[2]
-            olbl = f"OB Appt Set Rate  ({ota:,} appts / {ou:,} unique)"
+            olbl = f"OB Appt Set Rate  ({ota:,} appts / {ou:,} connected)"
             style_cell(row.cells[0], ORANGE_LIGHT, BORDER_GRAY)
             cell_para(row.cells[0], olbl, bold=True, size=9.5, color=BRAND_ORANGE, align=WD_ALIGN_PARAGRAPH.LEFT)
             style_cell(row.cells[1], ORANGE_LIGHT, BORDER_GRAY)
@@ -1005,8 +1006,10 @@ def generate_report(config: ReportConfig) -> str:
     p.paragraph_format.space_after = Pt(8)
     hn = any(not r.get("_hp", True) for _, b, _ in ib_b for r in b if r["name"] != "Group Avg")
     note = (
-        "Inbound and outbound Opportunities use unique customer counts from the CSV when available "
-        "(otherwise Connected). IB and OB appointment set rates use the same unique denominator as Opportunities."
+        "Inbound Opportunities use unique customer counts from the CSV when available (otherwise Connected); "
+        "IB appointment set rate uses that inbound unique count as its denominator. "
+        "Outbound Opportunities still use unique counts when available (otherwise Connected); "
+        "OB appointment set rate divides outbound appointments by outbound Connected."
     )
     if hn:
         note += "  Stores showing \u2014 in Change have no prior month data."

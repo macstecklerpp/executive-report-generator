@@ -61,16 +61,17 @@ def write_audit_workbook(
     ws0["A3"] = period_label
     ws0["A5"] = "Appt set rate"
     ws0["A5"].font = Font(bold=True)
-    ws0["A6"] = (
-        "IB appointment set rate (Key Group Performance + store summaries) = Total Appts ÷ unique inbound "
-        f'column "{ib_opportunities_column}", one decimal. '
-        + (
-            f'OB appointment set rate uses outbound column "{ob_opportunities_column}". '
-            if ob_opportunities_column
-            else ""
-        )
-        + '"Connected" columns in this workbook are for connect-rate reference only.'
+    ib_desc = (
+        "IB appointment set rate (Key Group Performance + store summaries) = inbound Total Appts ÷ unique inbound "
+        f'column "{ib_opportunities_column}", one decimal.'
     )
+    if ob_opportunities_column:
+        ib_desc += (
+            " OB appointment set rate = outbound appointments (Hard Appt + Soft Appt) ÷ outbound Connected, "
+            "one decimal. Outbound Opportunities counts still use unique column "
+            f'"{ob_opportunities_column}".'
+        )
+    ws0["A6"] = ib_desc
     ws0["A7"] = (
         '% hard = Hard Appt ÷ (Hard Appt + Soft Appt), rounded to whole percent. '
         'Soft uses CSV "Soft Appt" when present; otherwise Soft = Total Appts − Hard Appt '
@@ -202,7 +203,7 @@ def write_audit_workbook(
         "% hard",
     ]
     if not ib_only:
-        h2.append("OB appt set rate % (÷ unique)")
+        h2.append("OB appt set rate % (÷ connected)")
     for c, x in enumerate(h2, 1):
         ws2.cell(1, c, value=x).font = Font(bold=True)
     rr = 2
@@ -231,8 +232,7 @@ def write_audit_workbook(
         ws2.cell(rr, 10, value=pct_hard_of_hard_plus_soft(hap, sap))
         if not ib_only:
             tot_ob = int(d.get("curr_ob_total_appts", 0))
-            ouo_int = int(ouo) if ouo != "" else 0
-            ws2.cell(rr, 11, value=pct_appt_1dp(tot_ob, ouo_int))
+            ws2.cell(rr, 11, value=pct_appt_1dp(tot_ob, int(obconn) if obconn != "" else 0))
         rr += 1
 
     if not ib_only and ob_rows:
@@ -246,7 +246,7 @@ def write_audit_workbook(
             "Hard Appt",
             "Soft Appt",
             "Hard+Soft",
-            "OB appt set rate % (÷ unique)",
+            "OB appt set rate % (÷ connected)",
         ]
         for c, x in enumerate(ho, 1):
             ws3.cell(1, c, value=x).font = Font(bold=True)
@@ -275,7 +275,7 @@ def write_audit_workbook(
             ws3.cell(r3, 6, value=ha)
             ws3.cell(r3, 7, value=sa)
             ws3.cell(r3, 8, value=tot)
-            ws3.cell(r3, 9, value=pct_appt_1dp(tot, ou))
+            ws3.cell(r3, 9, value=pct_appt_1dp(tot, conn))
             r3 += 1
 
     Path(output_xlsx_path).parent.mkdir(parents=True, exist_ok=True)
