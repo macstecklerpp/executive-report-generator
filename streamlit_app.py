@@ -165,22 +165,39 @@ def main() -> None:
     st.session_state.setdefault("dealer_zip_bytes", None)
     st.session_state.setdefault("dealer_zip_name", None)
 
+    # Stable widget keys + one-shot defaults prevent Streamlit from clobbering user values on reruns
+    # after the first submission (fixes "second generation uses old name/data").
+    if "pp_group_name" not in st.session_state:
+        st.session_state.pp_group_name = "Example Automotive Group"
+    if "pp_period_start" not in st.session_state:
+        st.session_state.pp_period_start = date(2025, 4, 1)
+    if "pp_period_end" not in st.session_state:
+        st.session_state.pp_period_end = date(2025, 4, 28)
+    if "pp_ib_only" not in st.session_state:
+        st.session_state.pp_ib_only = False
+    if "pp_store_filter" not in st.session_state:
+        st.session_state.pp_store_filter = ""
+    if "pp_out_name" not in st.session_state:
+        st.session_state.pp_out_name = "PromptPath_Report.docx"
+    if "pp_listened_lines" not in st.session_state:
+        st.session_state.pp_listened_lines = list(LISTENED_LINE_TYPE_OPTIONS)
+
     with st.form("report_form"):
-        group_name = st.text_input("Dealer group name", value="Example Automotive Group")
+        group_name = st.text_input("Dealer group name", key="pp_group_name")
         c1, c2 = st.columns(2)
         with c1:
-            period_start = st.date_input("Period start", value=date(2025, 4, 1))
+            period_start = st.date_input("Period start", key="pp_period_start")
         with c2:
-            period_end = st.date_input("Period end", value=date(2025, 4, 28))
+            period_end = st.date_input("Period end", key="pp_period_end")
 
         ib_only = st.checkbox(
             "Inbound-only report (no outbound metrics; hides Sales Dials column)",
-            value=False,
+            key="pp_ib_only",
         )
 
         store_filter_raw = st.text_area(
             "Optional store filters (substring match; leave empty for all stores)",
-            value="",
+            key="pp_store_filter",
             height=110,
             placeholder="All Star\nGenesis Baton Rouge",
             help=(
@@ -189,25 +206,27 @@ def main() -> None:
             ),
         )
 
-        out_name = st.text_input("Output filename", value="PromptPath_Report.docx")
+        out_name = st.text_input("Output filename", key="pp_out_name")
 
-        ib_csv = st.file_uploader("Inbound leaderboard CSV (required)", type=["csv"])
+        ib_csv = st.file_uploader("Inbound leaderboard CSV (required)", type=["csv"], key="pp_ib_csv")
         ob_csv = st.file_uploader(
             "Outbound leaderboard CSV (required unless inbound-only is checked)",
             type=["csv"],
             disabled=ib_only,
             help="Ignored when inbound-only is enabled.",
+            key="pp_ob_csv",
         )
 
         dept_csv = st.file_uploader(
             "Department calls CSV or TSV (columns: dealer_name, category, calls)",
             type=["csv", "tsv", "txt"],
+            key="pp_dept_csv",
         )
 
         listened_lines = st.multiselect(
             "Lines PromptPath currently listens to",
             options=list(LISTENED_LINE_TYPE_OPTIONS),
-            default=list(LISTENED_LINE_TYPE_OPTIONS),
+            key="pp_listened_lines",
             help="Select all line types that apply. All selected = \"all your lines\" in the report.",
         )
 
@@ -258,14 +277,28 @@ def main() -> None:
     store_filter = normalize_store_filters(store_filter_raw)
     out_fn = _safe_docx_name(out_name)
 
+    # Copy upload bytes immediately (avoids UploadedFile buffer edge cases across repeated submits).
+    def _snapshot_upload(upload: Optional[object]) -> bytes:
+        if upload is None:
+            return b""
+        try:
+            upload.seek(0)
+            return upload.read()
+        except Exception:
+            return upload.getvalue() if hasattr(upload, "getvalue") else b""
+
+    ib_blob = _snapshot_upload(ib_csv)
+    dept_blob = _snapshot_upload(dept_csv)
+    ob_blob = _snapshot_upload(ob_csv) if not ib_only else b""
+
     tmpdir = tempfile.mkdtemp(prefix="pp_report_")
     ib_path = os.path.join(tmpdir, "inbound.csv")
     dept_path = os.path.join(tmpdir, "dept.csv")
 
     with open(ib_path, "wb") as f:
-        f.write(ib_csv.getvalue())
+        f.write(ib_blob)
     with open(dept_path, "wb") as f:
-        f.write(dept_csv.getvalue())
+        f.write(dept_blob)
 
     try:
         validate_inbound_csv(ib_path)
@@ -278,7 +311,7 @@ def main() -> None:
     if not ib_only:
         ob_path_opt = os.path.join(tmpdir, "outbound.csv")
         with open(ob_path_opt, "wb") as f:
-            f.write(ob_csv.getvalue())
+            f.write(ob_blob)
         try:
             validate_outbound_csv(ob_path_opt)
         except ValueError as ve:
