@@ -90,6 +90,22 @@ OB_CONNECTED_COLUMN_CANDIDATES = (
     "Unique Connected",
 )
 
+# Wide leaderboard "calls by department" export: inbound call counts per department (not Sales — SALES stays from IB CSV).
+WIDE_DEPT_INBOUND_COLUMNS: Dict[str, str] = {
+    "Service Inbound Calls": "service",
+    "Parts Inbound Calls": "parts",
+    "Finance Inbound Calls": "finance",
+    "Other Inbound Calls": "other",
+}
+
+DEPT_LONG_CAT_MAP: Dict[str, str] = {
+    "Sales Department": "sales",
+    "Service Department": "service",
+    "Parts Department": "parts",
+    "Finance Department": "finance",
+    "Other Department": "other",
+}
+
 # "Opportunities" rows: prefer unique-customer columns from leaderboard exports; else Connected.
 IB_UNIQUE_OPP_COLUMNS = (
     "Unique Customer Inbound",
@@ -122,6 +138,71 @@ def _first_matching_col(fieldnames: Optional[List[str]], candidates: tuple[str, 
 def _resolve_ob_connected_column(fieldnames: Optional[List[str]]) -> Optional[str]:
     """Header for outbound connects (prefer legacy Connected when both exist)."""
     return _first_matching_col(fieldnames, OB_CONNECTED_COLUMN_CANDIDATES)
+
+
+def _read_dept_csv(path: str) -> tuple[List[str], List[Dict[str, str]]]:
+    with open(path, newline="", encoding="utf-8") as f:
+        smp = f.read(1024)
+        f.seek(0)
+        dia = "excel-tab" if smp.count("\t") > smp.count(",") else "excel"
+        r = csv.DictReader(f, dialect=dia)
+        fn = list(r.fieldnames or [])
+        return fn, list(r)
+
+
+def _dept_csv_is_wide_format(fieldnames: List[str]) -> bool:
+    fn = set(fieldnames)
+    if "Dealerships" not in fn or "Period" not in fn:
+        return False
+    return all(col in fn for col in WIDE_DEPT_INBOUND_COLUMNS)
+
+
+def _load_department_tables(path: str) -> tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
+    """Return (current_period, previous_period) per-dealer dept call counts."""
+    fn, rows = _read_dept_csv(path)
+    dl_curr: Dict[str, Dict[str, int]] = {}
+    dl_prev: Dict[str, Dict[str, int]] = {}
+
+    if _dept_csv_is_wide_format(fn):
+        for row in rows:
+            dn = row.get("Dealerships", "").strip()
+            if not dn or dn == "All Dealers":
+                continue
+            pe = row.get("Period", "").strip()
+            if pe == "Current":
+                target = dl_curr
+            elif pe == "Previous":
+                target = dl_prev
+            else:
+                continue
+            if dn not in target:
+                target[dn] = {}
+            for col, key in WIDE_DEPT_INBOUND_COLUMNS.items():
+                target[dn][key] = si(row.get(col, 0))
+        return dl_curr, dl_prev
+
+    has_period = "Period" in fn
+    for row in rows:
+        dn = row.get("dealer_name", row.get("Dealerships", "")).strip()
+        cat = row.get("category", row.get("Category", "")).strip()
+        calls = si(row.get("calls", row.get("Calls", 0)))
+        key = DEPT_LONG_CAT_MAP.get(cat)
+        if not dn or not key:
+            continue
+        if has_period:
+            pe = row.get("Period", "").strip()
+            if pe == "Current":
+                target = dl_curr
+            elif pe == "Previous":
+                target = dl_prev
+            else:
+                continue
+        else:
+            target = dl_curr
+        if dn not in target:
+            target[dn] = {}
+        target[dn][key] = calls
+    return dl_curr, dl_prev
 
 
 @dataclass
@@ -385,6 +466,24 @@ def dcol(s, hib=True):
     return (GREEN if u else RED if d else MID_GRAY) if hib else (RED if u else GREEN if d else MID_GRAY)
 
 
+def _dept_count_cell(
+    cell,
+    bg,
+    curr: int,
+    prior: Optional[int],
+    *,
+    bold: bool = False,
+    tc_=GRAY,
+    align=WD_ALIGN_PARAGRAPH.CENTER,
+) -> None:
+    style_cell(cell, bg, BORDER_GRAY)
+    disp = f"{curr:,}" if curr > 0 else "—"
+    p = cell_para(cell, disp, bold=bold, size=9.5, color=tc_, align=align)
+    chg, _ = dstr(curr, prior) if prior is not None else ("—", None)
+    if chg != "—":
+        add_run(p, f"\n{chg}", size=8, color=dcol(chg, hib=True))
+
+
 def pct(n, d):
     return round(n / d * 100) if d else 0
 
@@ -452,20 +551,26 @@ def validate_outbound_csv(path: str) -> None:
 
 
 def validate_dept_csv(path: str) -> None:
-    with open(path, newline="", encoding="utf-8") as f:
-        smp = f.read(1024)
-        f.seek(0)
-        dia = "excel-tab" if smp.count("\t") > smp.count(",") else "excel"
-        r = csv.DictReader(f, dialect=dia)
-        fn = r.fieldnames or []
-    # Accept dealer_name OR Dealerships; category OR Category; calls OR Calls
+    fn, _ = _read_dept_csv(path)
+    if not fn:
+        raise ValueError("Department CSV: file is empty or has no header row.")
+    if _dept_csv_is_wide_format(fn):
+        missing = [c for c in WIDE_DEPT_INBOUND_COLUMNS if c not in fn]
+        if missing:
+            raise ValueError(
+                "Department CSV (wide format): missing column(s): "
+                + ", ".join(missing)
+                + '. Expected Dealerships, Period, and the four "* Inbound Calls" department columns.'
+            )
+        return
     has_dealer = "dealer_name" in fn or "Dealerships" in fn
     has_cat = "category" in fn or "Category" in fn
     has_calls = "calls" in fn or "Calls" in fn
     if not (has_dealer and has_cat and has_calls):
         raise ValueError(
-            "Department CSV: must include dealer column (dealer_name or Dealerships), "
-            "category column (category or Category), and calls column (calls or Calls)."
+            "Department CSV: use either (1) wide leaderboard export with Dealerships, Period, and "
+            "Service/Parts/Finance/Other Inbound Calls columns, or (2) long format with dealer, "
+            "category (Sales/Service/Parts/Finance/Other Department), and calls columns."
         )
 
 
@@ -588,27 +693,7 @@ def generate_report(config: ReportConfig) -> str:
             if roll:
                 roll["curr_ob_unique_opps"] = roll.get("ob_unique_opps", 0)
 
-    dl: Dict[str, Dict[str, int]] = {}
-    cat_map = {
-        "Sales Department": "sales",
-        "Service Department": "service",
-        "Parts Department": "parts",
-        "Finance Department": "finance",
-        "Other Department": "other",
-    }
-    with open(config.dept_csv_path, newline="", encoding="utf-8") as f:
-        smp = f.read(1024)
-        f.seek(0)
-        dia = "excel-tab" if smp.count("\t") > smp.count(",") else "excel"
-        for row in csv.DictReader(f, dialect=dia):
-            dn = row.get("dealer_name", row.get("Dealerships", "")).strip()
-            cat = row.get("category", row.get("Category", "")).strip()
-            calls = si(row.get("calls", row.get("Calls", 0)))
-            key = cat_map.get(cat)
-            if dn and key:
-                if dn not in dl:
-                    dl[dn] = {}
-                dl[dn][key] = calls
+    dl_curr, dl_prev = _load_department_tables(config.dept_csv_path)
 
     sf = normalize_store_filters(config.store_filter)
     sn = [s for s in dd if store_matches_filters(s, sf)]
@@ -831,32 +916,46 @@ def generate_report(config: ReportConfig) -> str:
             if ib_only
             else ["STORE", "SALES", "SERVICE", "PARTS", "FINANCE", "OTHER", "SALES DIALS"]
         )
+        metric_keys = ["sales", "service", "parts", "finance", "other"] + ([] if ib_only else ["dials"])
         rd = []
         for name in sn:
             d = dd[name]
-            dept = dl.get(name, {})
+            dept = dl_curr.get(name, {})
+            dept_p = dl_prev.get(name, {})
             r = {
                 "name": name,
                 "sales": d.get("curr_ib_calls", 0),
+                "sales_prev": d.get("prev_ib_calls"),
                 "service": dept.get("service", 0),
+                "service_prev": dept_p.get("service"),
                 "parts": dept.get("parts", 0),
+                "parts_prev": dept_p.get("parts"),
                 "finance": dept.get("finance", 0),
+                "finance_prev": dept_p.get("finance"),
                 "other": dept.get("other", 0),
+                "other_prev": dept_p.get("other"),
             }
             if not ib_only:
                 r["dials"] = d.get("curr_ob_dials", 0)
+                r["dials_prev"] = d.get("prev_ob_dials")
             rd.append(r)
         gt = {
             "name": "Group Total",
             "is_total": True,
             "sales": sum(r["sales"] for r in rd),
+            "sales_prev": sum(dd[n].get("prev_ib_calls", 0) for n in sn),
             "service": sum(r["service"] for r in rd),
+            "service_prev": sum(dl_prev.get(n, {}).get("service", 0) for n in sn),
             "parts": sum(r["parts"] for r in rd),
+            "parts_prev": sum(dl_prev.get(n, {}).get("parts", 0) for n in sn),
             "finance": sum(r["finance"] for r in rd),
+            "finance_prev": sum(dl_prev.get(n, {}).get("finance", 0) for n in sn),
             "other": sum(r["other"] for r in rd),
+            "other_prev": sum(dl_prev.get(n, {}).get("other", 0) for n in sn),
         }
         if not ib_only:
             gt["dials"] = oc_d.get("ob_dials", 0)
+            gt["dials_prev"] = sum(dd[n].get("prev_ob_dials", 0) for n in sn)
         ar = rd + [gt]
         nc = len(dc)
         t = doc.add_table(rows=2 + len(ar), cols=nc)
@@ -887,7 +986,7 @@ def generate_report(config: ReportConfig) -> str:
                 color=clr,
                 align=WD_ALIGN_PARAGRAPH.LEFT if ci == 0 else WD_ALIGN_PARAGRAPH.CENTER,
             )
-        keys = ["name", "sales", "service", "parts", "finance", "other"] + ([] if ib_only else ["dials"])
+        keys = ["name"] + metric_keys
         for ri, row_d in enumerate(ar):
             it = row_d.get("is_total", False)
             bg = BRAND_NAVY if it else (WHITE if ri % 2 == 0 else LIGHT_GRAY)
@@ -895,17 +994,26 @@ def generate_report(config: ReportConfig) -> str:
             row = t.rows[ri + 2]
             for ci, key in enumerate(keys):
                 c = row.cells[ci]
-                style_cell(c, bg, BORDER_GRAY)
-                val = row_d[key]
-                disp = str(val) if ci == 0 else (f"{val:,}" if val > 0 else "—")
-                cell_para(
-                    c,
-                    disp,
-                    bold=it,
-                    size=9.5,
-                    color=tc_,
-                    align=WD_ALIGN_PARAGRAPH.LEFT if ci == 0 else WD_ALIGN_PARAGRAPH.CENTER,
-                )
+                if ci == 0:
+                    style_cell(c, bg, BORDER_GRAY)
+                    cell_para(
+                        c,
+                        row_d["name"],
+                        bold=it,
+                        size=9.5,
+                        color=tc_,
+                        align=WD_ALIGN_PARAGRAPH.LEFT,
+                    )
+                else:
+                    prior_val = row_d.get(f"{key}_prev")
+                    _dept_count_cell(
+                        c,
+                        bg,
+                        int(row_d[key]),
+                        int(prior_val) if prior_val is not None else None,
+                        bold=it,
+                        tc_=tc_,
+                    )
         set_col_widths(t, cw)
 
     def kgp(doc):

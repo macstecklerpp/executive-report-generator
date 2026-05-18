@@ -218,9 +218,14 @@ def main() -> None:
         )
 
         dept_csv = st.file_uploader(
-            "Department calls CSV or TSV (columns: dealer_name, category, calls)",
+            "Department calls CSV or TSV",
             type=["csv", "tsv", "txt"],
             key="pp_dept_csv",
+            help=(
+                "Long format: dealer_name, category, calls. Or wide leaderboard export with "
+                "Dealerships, Period (Current/Previous), and Service/Parts/Finance/Other Inbound Calls. "
+                "Current + Previous rows enable month-over-month % under each call type."
+            ),
         )
 
         listened_lines = st.multiselect(
