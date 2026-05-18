@@ -26,7 +26,8 @@
   - Dealer names in the dept file must match the Dealerships column in the CSV.
   - Inbound Opportunities and IB appointment set rate use the unique-customer column when present
     (see IB_UNIQUE_OPP_COLUMNS); otherwise Connected. Outbound Opportunities use OB_UNIQUE_OPP_COLUMNS similarly.
-    OB appointment set rate divides outbound appointments by outbound Connected. Connect rate uses Connected ÷ Dials.
+    Outbound connect-count (connect rate numerator, OB appt set rate denominator) uses the first matching column in
+    OB_CONNECTED_COLUMN_CANDIDATES (preferring "Connected" when both Connected and "Unique Connected" exist).
   - Optional inbound CSV column Soft Appt for hard-percent denominator; otherwise Soft = Total Appts minus Hard Appt.
 ================================================================================
 """
@@ -78,9 +79,15 @@ REQUIRED_OUTBOUND_COLUMNS = (
     "Dealerships",
     "Period",
     "Outbound Dials",
-    "Connected",
     "Hard Appt",
     "Soft Appt",
+)
+
+# Outbound rows can label connect count as "Connected" or (common on newer exports) "Unique Connected".
+OB_CONNECTED_COLUMN_CANDIDATES = (
+    "Connected",
+    "Unique Connected Outbound",
+    "Unique Connected",
 )
 
 # "Opportunities" rows: prefer unique-customer columns from leaderboard exports; else Connected.
@@ -110,6 +117,11 @@ def _first_matching_col(fieldnames: Optional[List[str]], candidates: tuple[str, 
         if c in have:
             return c
     return None
+
+
+def _resolve_ob_connected_column(fieldnames: Optional[List[str]]) -> Optional[str]:
+    """Header for outbound connects (prefer legacy Connected when both exist)."""
+    return _first_matching_col(fieldnames, OB_CONNECTED_COLUMN_CANDIDATES)
 
 
 @dataclass
@@ -430,7 +442,13 @@ def validate_inbound_csv(path: str) -> None:
 def validate_outbound_csv(path: str) -> None:
     with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
-        _validate_csv_columns(r.fieldnames, REQUIRED_OUTBOUND_COLUMNS, "Outbound CSV")
+        fn = r.fieldnames
+    _validate_csv_columns(fn, REQUIRED_OUTBOUND_COLUMNS, "Outbound CSV")
+    if _resolve_ob_connected_column(fn) is None:
+        raise ValueError(
+            "Outbound CSV: missing a Connected / connect-count column. "
+            'Expected one of: "Connected", "Unique Connected Outbound", "Unique Connected".'
+        )
 
 
 def validate_dept_csv(path: str) -> None:
@@ -523,13 +541,15 @@ def generate_report(config: ReportConfig) -> str:
     op_d: Dict[str, Any] = {}
     ob: List[Dict[str, str]] = []
     ob_opp_col: Optional[str] = None
+    ob_connected_col = "Connected"
     if not ib_only:
         if not config.ob_csv_path:
             raise ValueError("Outbound CSV path is required when ib_only is False.")
         with open(config.ob_csv_path, newline="", encoding="utf-8") as f:
             ob = list(csv.DictReader(f))
         _ob_fields = list(ob[0].keys()) if ob else []
-        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or "Connected"
+        ob_connected_col = _resolve_ob_connected_column(_ob_fields) or "Connected"
+        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or ob_connected_col
         for row in ob:
             dn = row["Dealerships"].strip()
             pe = row["Period"].strip()
@@ -542,7 +562,7 @@ def generate_report(config: ReportConfig) -> str:
             h_ob = si(row["Hard Appt"])
             s_ob = si(row["Soft Appt"])
             d[px + "ob_dials"] = si(row["Outbound Dials"])
-            d[px + "ob_connected"] = si(row["Connected"])
+            d[px + "ob_connected"] = si(row[ob_connected_col])
             d[px + "ob_unique_opps"] = si(row[ob_opp_col])
             d[px + "ob_total_appts"] = h_ob + s_ob
             d[px + "ob_hard_appts"] = h_ob
@@ -555,7 +575,7 @@ def generate_report(config: ReportConfig) -> str:
             s_ob = si(row["Soft Appt"])
             return {
                 "ob_dials": si(row["Outbound Dials"]),
-                "ob_connected": si(row["Connected"]),
+                "ob_connected": si(row[ob_connected_col]),
                 "ob_unique_opps": si(row[ob_opp_col]),
                 "ob_total_appts": h_ob + s_ob,
                 "ob_hard_appts": h_ob,
@@ -1033,6 +1053,7 @@ def generate_report(config: ReportConfig) -> str:
         inbound_has_soft_appt_column=inbound_soft_col,
         ib_opportunities_column=ib_opp_col,
         ob_opportunities_column=ob_opp_col,
+        ob_connected_column=ob_connected_col,
     )
     return config.output_path
 
@@ -1079,7 +1100,8 @@ def _filtered_sorted_store_names(config: ReportConfig) -> List[str]:
         with open(config.ob_csv_path, newline="", encoding="utf-8") as f:
             ob = list(csv.DictReader(f))
         _ob_fields = list(ob[0].keys()) if ob else []
-        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or "Connected"
+        ob_connected_col = _resolve_ob_connected_column(_ob_fields) or "Connected"
+        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or ob_connected_col
         for row in ob:
             dn = row["Dealerships"].strip()
             pe = row["Period"].strip()
@@ -1092,7 +1114,7 @@ def _filtered_sorted_store_names(config: ReportConfig) -> List[str]:
             h_ob = si(row["Hard Appt"])
             s_ob = si(row["Soft Appt"])
             d[px + "ob_dials"] = si(row["Outbound Dials"])
-            d[px + "ob_connected"] = si(row["Connected"])
+            d[px + "ob_connected"] = si(row[ob_connected_col])
             d[px + "ob_unique_opps"] = si(row[ob_opp_col])
             d[px + "ob_total_appts"] = h_ob + s_ob
             d[px + "ob_hard_appts"] = h_ob

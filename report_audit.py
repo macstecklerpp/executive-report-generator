@@ -30,6 +30,7 @@ def write_audit_workbook(
     inbound_has_soft_appt_column: bool,
     ib_opportunities_column: str,
     ob_opportunities_column: Optional[str] = None,
+    ob_connected_column: str = "Connected",
 ) -> str:
     from openpyxl import Workbook
     from openpyxl.styles import Font
@@ -65,12 +66,13 @@ def write_audit_workbook(
         "IB appointment set rate (Key Group Performance + store summaries) = inbound Total Appts ÷ unique inbound "
         f'column "{ib_opportunities_column}", one decimal.'
     )
-    if ob_opportunities_column:
+    if not ib_only:
         ib_desc += (
-            " OB appointment set rate = outbound appointments (Hard Appt + Soft Appt) ÷ outbound Connected, "
-            "one decimal. Outbound Opportunities counts still use unique column "
-            f'"{ob_opportunities_column}".'
+            f' Outbound connect count is read from "{ob_connected_column}" (matches Connect-rate numerator '
+            'and denominator for outbound appointment set rate). '
         )
+        if ob_opportunities_column:
+            ib_desc += f'Outbound Opportunities use unique column "{ob_opportunities_column}".'
     ws0["A6"] = ib_desc
     ws0["A7"] = (
         '% hard = Hard Appt ÷ (Hard Appt + Soft Appt), rounded to whole percent. '
@@ -241,7 +243,7 @@ def write_audit_workbook(
             "Dealerships",
             "Period",
             "Outbound Dials",
-            "Connected",
+            ob_connected_column,
             f"Unique ({ob_opportunities_column})",
             "Hard Appt",
             "Soft Appt",
@@ -262,7 +264,7 @@ def write_audit_workbook(
             )
             if not row:
                 continue
-            conn = _si(row.get("Connected"))
+            conn = _si(row.get(ob_connected_column))
             ou = _si(row.get(ob_opportunities_column)) if ob_opportunities_column else conn
             ha = _si(row.get("Hard Appt"))
             sa = _si(row.get("Soft Appt"))
