@@ -16,7 +16,7 @@ import tempfile
 import zipfile
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
 
@@ -25,9 +25,19 @@ try:
     import openpyxl  # noqa: F401
 except ModuleNotFoundError as e:
     st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
-    st.error(
-        f"Missing dependency: {e}. Streamlit Cloud installs packages from **requirements.txt** "
-        "at the repository root (needs `python-docx` and `openpyxl`). Commit that file, reboot the app, "
+    st.error(f"Missing dependency: {e}")
+    st.markdown(
+        "Install dependencies into your active Python environment:\n\n"
+        "```bash\n"
+        "cd /path/to/CS-BiWeeklyReports\n"
+        "python3 -m venv .venv\n"
+        "source .venv/bin/activate\n"
+        "pip install -r requirements.txt\n"
+        "streamlit run streamlit_app.py\n"
+        "```\n\n"
+        "If you already have a `.venv` in this project, activate it first (`source .venv/bin/activate`) "
+        "or run directly with `.venv/bin/streamlit run streamlit_app.py`.\n\n"
+        "On Streamlit Cloud, ensure `requirements.txt` is committed at the repo root, then reboot the app "
         "and check **Manage app → Logs** for pip errors."
     )
     st.stop()
@@ -111,23 +121,25 @@ def _ensure_password_gate() -> None:
     st.stop()
 
 
-def _maybe_sign_out_sidebar() -> None:
-    if not _collect_allowed_passwords():
-        return
-    if not st.session_state.get("_pp_authenticated"):
-        return
+def _maybe_sidebar_actions() -> None:
     with st.sidebar:
-        st.caption("Session")
-        if st.button("Sign out"):
-            st.session_state._pp_authenticated = False
-            st.rerun()
+        if _collect_allowed_passwords() and st.session_state.get("_pp_authenticated"):
+            st.caption("Session")
+            if st.button("Sign out"):
+                st.session_state._pp_authenticated = False
+                st.rerun()
+
+        if st.session_state.get("pp_reports"):
+            st.caption("Results")
+            if st.button("Clear results"):
+                st.session_state.pp_reports = []
+                st.rerun()
 
 
 def _safe_docx_name(name: str, default: str = "PromptPath_Report.docx") -> str:
     base = (name or "").strip() or default
     if not base.lower().endswith(".docx"):
         base += ".docx"
-    # Avoid path traversal and odd characters
     base = os.path.basename(base)
     base = re.sub(r'[^A-Za-z0-9._\- ]', "_", base).strip()
     return base or default
@@ -148,56 +160,285 @@ def _logo_path_from_upload(uploaded: Optional[object], tmpdir: str) -> str:
     )
 
 
-def main() -> None:
-    st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
-    _ensure_password_gate()
-    _maybe_sign_out_sidebar()
-    st.title("PromptPath Executive Summary Report")
-    st.caption(
-        "Upload leaderboard exports and department call volumes. Each run saves the recap .docx plus "
-        "a companion number audit Excel file (_audit.xlsx) with raw CSV figures (All Dealers vs sum of dealers)."
+def _snapshot_upload(upload: Optional[object]) -> bytes:
+    if upload is None:
+        return b""
+    try:
+        upload.seek(0)
+        return upload.read()
+    except Exception:
+        return upload.getvalue() if hasattr(upload, "getvalue") else b""
+
+
+def _next_group_id() -> int:
+    n = int(st.session_state.get("pp_next_group_id", 0)) + 1
+    st.session_state.pp_next_group_id = n
+    return n
+
+
+def _empty_group(gid: int) -> dict[str, Any]:
+    return {
+        "id": gid,
+        "group_name": "",
+        "period_start": date(2025, 4, 1),
+        "period_end": date(2025, 4, 28),
+        "ib_only": False,
+        "store_filter": "",
+        "out_name": "PromptPath_Report.docx",
+        "listened_lines": list(LISTENED_LINE_TYPE_OPTIONS),
+        "ib_blob": b"",
+        "ob_blob": b"",
+        "dept_blob": b"",
+    }
+
+
+def _init_batch_session_state() -> None:
+    st.session_state.setdefault("pp_reports", [])
+    st.session_state.setdefault("pp_next_group_id", 0)
+    if "pp_groups" not in st.session_state or not st.session_state.pp_groups:
+        gid = _next_group_id()
+        st.session_state.pp_groups = [_empty_group(gid)]
+
+
+def _group_idx(gid: int) -> Optional[int]:
+    for i, g in enumerate(st.session_state.pp_groups):
+        if g["id"] == gid:
+            return i
+    return None
+
+
+def _init_group_widgets(g: dict[str, Any]) -> None:
+    gid = g["id"]
+    defaults: dict[str, Any] = {
+        f"pp_g{gid}_group_name": g.get("group_name", ""),
+        f"pp_g{gid}_period_start": g.get("period_start", date(2025, 4, 1)),
+        f"pp_g{gid}_period_end": g.get("period_end", date(2025, 4, 28)),
+        f"pp_g{gid}_ib_only": g.get("ib_only", False),
+        f"pp_g{gid}_store_filter": g.get("store_filter", ""),
+        f"pp_g{gid}_out_name": g.get("out_name", "PromptPath_Report.docx"),
+        f"pp_g{gid}_listened_lines": g.get("listened_lines", list(LISTENED_LINE_TYPE_OPTIONS)),
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+def _on_upload_change(gid: int, blob_field: str, widget_key: str) -> None:
+    idx = _group_idx(gid)
+    if idx is None:
+        return
+    upload = st.session_state.get(widget_key)
+    st.session_state.pp_groups[idx][blob_field] = _snapshot_upload(upload)
+
+
+def _read_group_inputs(g: dict[str, Any]) -> dict[str, Any]:
+    gid = g["id"]
+    ib_upload = st.session_state.get(f"pp_g{gid}_ib_csv")
+    ob_upload = st.session_state.get(f"pp_g{gid}_ob_csv")
+    dept_upload = st.session_state.get(f"pp_g{gid}_dept_csv")
+    ib_only = bool(st.session_state.get(f"pp_g{gid}_ib_only", False))
+
+    ib_blob = _snapshot_upload(ib_upload) if ib_upload is not None else g.get("ib_blob", b"")
+    dept_blob = _snapshot_upload(dept_upload) if dept_upload is not None else g.get("dept_blob", b"")
+    ob_blob = b""
+    if not ib_only:
+        ob_blob = _snapshot_upload(ob_upload) if ob_upload is not None else g.get("ob_blob", b"")
+
+    idx = _group_idx(gid)
+    if idx is not None:
+        st.session_state.pp_groups[idx]["ib_blob"] = ib_blob
+        st.session_state.pp_groups[idx]["dept_blob"] = dept_blob
+        st.session_state.pp_groups[idx]["ob_blob"] = ob_blob
+
+    return {
+        "id": gid,
+        "group_name": str(st.session_state.get(f"pp_g{gid}_group_name", "")).strip(),
+        "period_start": st.session_state.get(f"pp_g{gid}_period_start"),
+        "period_end": st.session_state.get(f"pp_g{gid}_period_end"),
+        "ib_only": ib_only,
+        "store_filter_raw": str(st.session_state.get(f"pp_g{gid}_store_filter", "")),
+        "out_name": str(st.session_state.get(f"pp_g{gid}_out_name", "PromptPath_Report.docx")),
+        "listened_lines": list(st.session_state.get(f"pp_g{gid}_listened_lines", [])),
+        "ib_blob": ib_blob,
+        "ob_blob": ob_blob,
+        "dept_blob": dept_blob,
+    }
+
+
+def _validate_group_inputs(cfg: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    label = cfg["group_name"] or f"Group {cfg['id']}"
+    if not cfg["group_name"]:
+        errors.append(f"{label}: enter a dealer group name.")
+    if cfg["period_end"] < cfg["period_start"]:
+        errors.append(f"{label}: period end must be on or after period start.")
+    if not cfg["ib_blob"]:
+        errors.append(f"{label}: upload the inbound leaderboard CSV.")
+    if not cfg["dept_blob"]:
+        errors.append(f"{label}: upload the department calls file.")
+    if not cfg["ib_only"] and not cfg["ob_blob"]:
+        errors.append(f"{label}: upload the outbound CSV or enable inbound-only.")
+    return errors
+
+
+def _error_result(group_name: str, message: str) -> dict[str, Any]:
+    return {
+        "group_name": group_name or "Unnamed group",
+        "docx_bytes": None,
+        "docx_name": None,
+        "audit_bytes": None,
+        "audit_name": None,
+        "zip_bytes": None,
+        "zip_name": None,
+        "error": message,
+    }
+
+
+def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
+    group_name = cfg["group_name"]
+    display_name = group_name or f"Group {cfg['id']}"
+    store_filter = normalize_store_filters(cfg["store_filter_raw"])
+    out_fn = _safe_docx_name(cfg["out_name"])
+
+    tmpdir = tempfile.mkdtemp(prefix="pp_report_")
+    ib_path = os.path.join(tmpdir, "inbound.csv")
+    dept_path = os.path.join(tmpdir, "dept.csv")
+
+    with open(ib_path, "wb") as f:
+        f.write(cfg["ib_blob"])
+    with open(dept_path, "wb") as f:
+        f.write(cfg["dept_blob"])
+
+    validate_inbound_csv(ib_path)
+    validate_dept_csv(dept_path)
+
+    ob_path_opt: Optional[str] = None
+    if not cfg["ib_only"]:
+        ob_path_opt = os.path.join(tmpdir, "outbound.csv")
+        with open(ob_path_opt, "wb") as f:
+            f.write(cfg["ob_blob"])
+        validate_outbound_csv(ob_path_opt)
+
+    logo_path = _logo_path_from_upload(None, tmpdir)
+    out_path = os.path.join(tmpdir, out_fn)
+
+    report_cfg = ReportConfig(
+        group_name=group_name,
+        period_start=cfg["period_start"].strftime("%Y-%m-%d"),
+        period_end=cfg["period_end"].strftime("%Y-%m-%d"),
+        ib_csv_path=ib_path,
+        ob_csv_path=ob_path_opt,
+        dept_csv_path=dept_path,
+        logo_path=logo_path,
+        output_path=out_path,
+        ib_only=cfg["ib_only"],
+        store_filter=store_filter,
+        listened_lines=cfg["listened_lines"],
     )
 
-    st.session_state.setdefault("docx_bytes", None)
-    st.session_state.setdefault("docx_name", None)
-    st.session_state.setdefault("audit_bytes", None)
-    st.session_state.setdefault("audit_name", None)
-    st.session_state.setdefault("dealer_zip_bytes", None)
-    st.session_state.setdefault("dealer_zip_name", None)
+    generate_report(report_cfg)
 
-    # Stable widget keys + one-shot defaults prevent Streamlit from clobbering user values on reruns
-    # after the first submission (fixes "second generation uses old name/data").
-    if "pp_group_name" not in st.session_state:
-        st.session_state.pp_group_name = "Example Automotive Group"
-    if "pp_period_start" not in st.session_state:
-        st.session_state.pp_period_start = date(2025, 4, 1)
-    if "pp_period_end" not in st.session_state:
-        st.session_state.pp_period_end = date(2025, 4, 28)
-    if "pp_ib_only" not in st.session_state:
-        st.session_state.pp_ib_only = False
-    if "pp_store_filter" not in st.session_state:
-        st.session_state.pp_store_filter = ""
-    if "pp_out_name" not in st.session_state:
-        st.session_state.pp_out_name = "PromptPath_Report.docx"
-    if "pp_listened_lines" not in st.session_state:
-        st.session_state.pp_listened_lines = list(LISTENED_LINE_TYPE_OPTIONS)
+    audit_name = Path(out_fn).stem + "_audit.xlsx"
+    audit_path = os.path.join(tmpdir, audit_name)
 
-    with st.form("report_form"):
-        group_name = st.text_input("Dealer group name", key="pp_group_name")
+    with open(out_path, "rb") as f:
+        docx_bytes = f.read()
+
+    audit_bytes: Optional[bytes] = None
+    if os.path.isfile(audit_path):
+        with open(audit_path, "rb") as f:
+            audit_bytes = f.read()
+
+    zip_bytes: Optional[bytes] = None
+    zip_name = f"{Path(out_fn).stem}_individual_dealers.zip"
+    dealer_dir = os.path.join(tmpdir, "dealers")
+    try:
+        dealer_paths = generate_dealer_reports(report_cfg, dealer_dir)
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in dealer_paths:
+                zf.write(p, arcname=os.path.basename(p))
+        zip_buf.seek(0)
+        zip_bytes = zip_buf.read()
+    except Exception:
+        zip_bytes = None
+        zip_name = None
+
+    return {
+        "group_name": display_name,
+        "docx_bytes": docx_bytes,
+        "docx_name": out_fn,
+        "audit_bytes": audit_bytes,
+        "audit_name": audit_name if audit_bytes else None,
+        "zip_bytes": zip_bytes,
+        "zip_name": zip_name,
+        "error": None,
+    }
+
+
+def _run_batch() -> None:
+    groups = st.session_state.pp_groups
+    if not groups:
+        st.error("Add at least one dealer group.")
+        return
+
+    st.session_state.pp_reports = []
+    progress = st.progress(0.0, text="Starting batch generation…")
+    total = len(groups)
+
+    for i, g in enumerate(groups):
+        cfg = _read_group_inputs(g)
+        display_name = cfg["group_name"] or f"Group {cfg['id']}"
+        progress.progress(i / total, text=f"Processing {display_name} ({i + 1} of {total})…")
+
+        validation_errors = _validate_group_inputs(cfg)
+        if validation_errors:
+            st.session_state.pp_reports.append(
+                _error_result(display_name, "\n".join(validation_errors))
+            )
+            continue
+
+        try:
+            result = _generate_one_group(cfg)
+            st.session_state.pp_reports.append(result)
+        except ValueError as ve:
+            st.session_state.pp_reports.append(_error_result(display_name, str(ve)))
+        except FileNotFoundError as e:
+            st.session_state.pp_reports.append(_error_result(display_name, f"File not found: {e}"))
+        except Exception as e:
+            st.session_state.pp_reports.append(
+                _error_result(display_name, f"Unexpected error: {e}")
+            )
+
+    progress.progress(1.0, text="Batch generation complete.")
+
+
+def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
+    gid = g["id"]
+    _init_group_widgets(g)
+
+    title = str(st.session_state.get(f"pp_g{gid}_group_name", "")).strip() or f"Group {idx + 1}"
+    with st.expander(title, expanded=True):
+        if can_remove:
+            if st.button("Remove group", key=f"pp_g{gid}_remove"):
+                st.session_state.pp_groups.pop(idx)
+                st.rerun()
+
+        st.text_input("Dealer group name", key=f"pp_g{gid}_group_name")
         c1, c2 = st.columns(2)
         with c1:
-            period_start = st.date_input("Period start", key="pp_period_start")
+            st.date_input("Period start", key=f"pp_g{gid}_period_start")
         with c2:
-            period_end = st.date_input("Period end", key="pp_period_end")
+            st.date_input("Period end", key=f"pp_g{gid}_period_end")
 
-        ib_only = st.checkbox(
+        st.checkbox(
             "Inbound-only report (no outbound metrics; hides Sales Dials column)",
-            key="pp_ib_only",
+            key=f"pp_g{gid}_ib_only",
         )
 
-        store_filter_raw = st.text_area(
+        st.text_area(
             "Optional store filters (substring match; leave empty for all stores)",
-            key="pp_store_filter",
+            key=f"pp_g{gid}_store_filter",
             height=110,
             placeholder="All Star\nGenesis Baton Rouge",
             help=(
@@ -206,223 +447,133 @@ def main() -> None:
             ),
         )
 
-        out_name = st.text_input("Output filename", key="pp_out_name")
+        st.text_input("Output filename", key=f"pp_g{gid}_out_name")
 
-        ib_csv = st.file_uploader("Inbound leaderboard CSV (required)", type=["csv"], key="pp_ib_csv")
-        ob_csv = st.file_uploader(
+        ib_key = f"pp_g{gid}_ib_csv"
+        ob_key = f"pp_g{gid}_ob_csv"
+        dept_key = f"pp_g{gid}_dept_csv"
+
+        st.file_uploader(
+            "Inbound leaderboard CSV (required)",
+            type=["csv"],
+            key=ib_key,
+            on_change=_on_upload_change,
+            args=(gid, "ib_blob", ib_key),
+        )
+        st.file_uploader(
             "Outbound leaderboard CSV (required unless inbound-only is checked)",
             type=["csv"],
-            disabled=ib_only,
+            disabled=bool(st.session_state.get(f"pp_g{gid}_ib_only", False)),
             help="Ignored when inbound-only is enabled.",
-            key="pp_ob_csv",
+            key=ob_key,
+            on_change=_on_upload_change,
+            args=(gid, "ob_blob", ob_key),
         )
-
-        dept_csv = st.file_uploader(
+        st.file_uploader(
             "Department calls CSV or TSV",
             type=["csv", "tsv", "txt"],
-            key="pp_dept_csv",
+            key=dept_key,
             help=(
                 "Long format: dealer_name, category, calls. Or wide leaderboard export with "
                 "Dealerships, Period (Current/Previous), and Service/Parts/Finance/Other Inbound Calls. "
                 "Current + Previous rows enable month-over-month % under each call type."
             ),
+            on_change=_on_upload_change,
+            args=(gid, "dept_blob", dept_key),
         )
 
-        listened_lines = st.multiselect(
+        st.multiselect(
             "Lines PromptPath currently listens to",
             options=list(LISTENED_LINE_TYPE_OPTIONS),
-            key="pp_listened_lines",
-            help="Select all line types that apply. All selected = \"all your lines\" in the report.",
+            key=f"pp_g{gid}_listened_lines",
+            help='Select all line types that apply. All selected = "all your lines" in the report.',
         )
 
-        submitted = st.form_submit_button("Generate DOCX")
+        if g.get("ib_blob"):
+            st.caption("Inbound CSV loaded.")
+        if g.get("dept_blob"):
+            st.caption("Department CSV loaded.")
+        if g.get("ob_blob"):
+            st.caption("Outbound CSV loaded.")
 
-    if not submitted:
-        if st.session_state.docx_bytes:
-            st.subheader("Download")
-            st.download_button(
-                label="Download last generated report",
-                data=st.session_state.docx_bytes,
-                file_name=st.session_state.docx_name or "PromptPath_Report.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-        if st.session_state.audit_bytes:
-            st.download_button(
-                label="Download last number audit (Excel)",
-                data=st.session_state.audit_bytes,
-                file_name=st.session_state.audit_name or "PromptPath_Report_audit.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        if st.session_state.dealer_zip_bytes:
-            st.download_button(
-                label="Download last individual dealer reports (ZIP)",
-                data=st.session_state.dealer_zip_bytes,
-                file_name=st.session_state.dealer_zip_name or "PromptPath_Report_individual_dealers.zip",
-                mime="application/zip",
-            )
+
+def _render_results() -> None:
+    reports = st.session_state.get("pp_reports") or []
+    if not reports:
         return
 
-    errors: list[str] = []
-    if not group_name.strip():
-        errors.append("Enter a dealer group name.")
-    if period_end < period_start:
-        errors.append("Period end must be on or after period start.")
-    if ib_csv is None:
-        errors.append("Upload the inbound leaderboard CSV.")
-    if dept_csv is None:
-        errors.append("Upload the department calls file.")
-    if not ib_only and ob_csv is None:
-        errors.append("Upload the outbound CSV or enable inbound-only.")
+    st.divider()
+    ok = sum(1 for r in reports if not r.get("error"))
+    failed = len(reports) - ok
+    st.subheader(f"Results — {len(reports)} group(s)")
+    if failed:
+        st.warning(f"{ok} succeeded, {failed} failed.")
+    else:
+        st.success(f"All {ok} report(s) generated successfully.")
 
-    if errors:
-        for e in errors:
-            st.error(e)
-        return
+    for i, entry in enumerate(reversed(reports)):
+        with st.expander(entry["group_name"], expanded=True):
+            if entry.get("error"):
+                st.error(entry["error"])
+                continue
 
-    store_filter = normalize_store_filters(store_filter_raw)
-    out_fn = _safe_docx_name(out_name)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.download_button(
+                    label="Download report (.docx)",
+                    data=entry["docx_bytes"],
+                    file_name=entry["docx_name"] or "PromptPath_Report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"dl_docx_{i}_{entry['group_name']}",
+                )
+            with c2:
+                if entry.get("audit_bytes"):
+                    st.download_button(
+                        label="Download audit (.xlsx)",
+                        data=entry["audit_bytes"],
+                        file_name=entry["audit_name"] or "PromptPath_Report_audit.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_audit_{i}_{entry['group_name']}",
+                    )
+            with c3:
+                if entry.get("zip_bytes"):
+                    st.download_button(
+                        label="Download individual dealers (.zip)",
+                        data=entry["zip_bytes"],
+                        file_name=entry["zip_name"] or "PromptPath_Report_individual_dealers.zip",
+                        mime="application/zip",
+                        key=f"dl_zip_{i}_{entry['group_name']}",
+                    )
 
-    # Copy upload bytes immediately (avoids UploadedFile buffer edge cases across repeated submits).
-    def _snapshot_upload(upload: Optional[object]) -> bytes:
-        if upload is None:
-            return b""
-        try:
-            upload.seek(0)
-            return upload.read()
-        except Exception:
-            return upload.getvalue() if hasattr(upload, "getvalue") else b""
 
-    ib_blob = _snapshot_upload(ib_csv)
-    dept_blob = _snapshot_upload(dept_csv)
-    ob_blob = _snapshot_upload(ob_csv) if not ib_only else b""
-
-    tmpdir = tempfile.mkdtemp(prefix="pp_report_")
-    ib_path = os.path.join(tmpdir, "inbound.csv")
-    dept_path = os.path.join(tmpdir, "dept.csv")
-
-    with open(ib_path, "wb") as f:
-        f.write(ib_blob)
-    with open(dept_path, "wb") as f:
-        f.write(dept_blob)
-
-    try:
-        validate_inbound_csv(ib_path)
-        validate_dept_csv(dept_path)
-    except ValueError as ve:
-        st.error(str(ve))
-        return
-
-    ob_path_opt: Optional[str] = None
-    if not ib_only:
-        ob_path_opt = os.path.join(tmpdir, "outbound.csv")
-        with open(ob_path_opt, "wb") as f:
-            f.write(ob_blob)
-        try:
-            validate_outbound_csv(ob_path_opt)
-        except ValueError as ve:
-            st.error(str(ve))
-            return
-
-    try:
-        logo_path = _logo_path_from_upload(None, tmpdir)
-    except FileNotFoundError as e:
-        st.error(str(e))
-        return
-
-    out_path = os.path.join(tmpdir, out_fn)
-
-    cfg = ReportConfig(
-        group_name=group_name.strip(),
-        period_start=period_start.strftime("%Y-%m-%d"),
-        period_end=period_end.strftime("%Y-%m-%d"),
-        ib_csv_path=ib_path,
-        ob_csv_path=ob_path_opt,
-        dept_csv_path=dept_path,
-        logo_path=logo_path,
-        output_path=out_path,
-        ib_only=ib_only,
-        store_filter=store_filter,
-        listened_lines=listened_lines,
+def main() -> None:
+    st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
+    _ensure_password_gate()
+    _maybe_sidebar_actions()
+    st.title("PromptPath Executive Summary Report")
+    st.caption(
+        "Configure one or more dealer groups below, upload each group's CSVs, then click "
+        "**Generate All Reports**. Each group produces a recap .docx, a number audit Excel file "
+        "(_audit.xlsx), and a ZIP of individual dealer reports."
     )
 
-    st.session_state.dealer_zip_bytes = None
-    st.session_state.dealer_zip_name = None
+    _init_batch_session_state()
 
-    try:
-        generate_report(cfg)
-    except FileNotFoundError as e:
-        st.error(f"File not found: {e}")
-        return
-    except Exception as e:
-        st.exception(e)
-        return
+    groups = st.session_state.pp_groups
+    for idx, g in enumerate(groups):
+        _render_group_card(g, idx, can_remove=len(groups) > 1)
 
-    dealer_dir = os.path.join(tmpdir, "dealers")
-    dealer_paths: list[str] = []
-    try:
-        dealer_paths = generate_dealer_reports(cfg, dealer_dir)
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in dealer_paths:
-                zf.write(p, arcname=os.path.basename(p))
-        zip_buf.seek(0)
-        st.session_state.dealer_zip_bytes = zip_buf.read()
-        st.session_state.dealer_zip_name = f"{Path(out_fn).stem}_individual_dealers.zip"
-    except Exception as e:
-        st.warning(f"Individual dealer reports could not be generated: {e}")
+    col_add, col_gen = st.columns([1, 2])
+    with col_add:
+        if st.button("+ Add Another Group"):
+            st.session_state.pp_groups.append(_empty_group(_next_group_id()))
+            st.rerun()
+    with col_gen:
+        if st.button("Generate All Reports", type="primary"):
+            _run_batch()
+            st.rerun()
 
-    audit_name = Path(out_fn).stem + "_audit.xlsx"
-    audit_path = os.path.join(tmpdir, audit_name)
-
-    with open(out_path, "rb") as f:
-        st.session_state.docx_bytes = f.read()
-    st.session_state.docx_name = out_fn
-    if os.path.isfile(audit_path):
-        with open(audit_path, "rb") as f:
-            st.session_state.audit_bytes = f.read()
-        st.session_state.audit_name = audit_name
-    else:
-        st.session_state.audit_bytes = None
-        st.session_state.audit_name = None
-
-    if st.session_state.audit_bytes:
-        st.success(f"Generated: {out_fn} and {audit_name}")
-    else:
-        st.success(f"Generated: {out_fn}")
-        st.warning("Number audit workbook was not created (check that openpyxl is installed).")
-    nzip = bool(st.session_state.dealer_zip_bytes)
-    if nzip:
-        st.info(
-            f"Individual dealer reports: ZIP with {len(dealer_paths)} store file(s) "
-            f"({st.session_state.dealer_zip_name})."
-        )
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button(
-            label="Download DOCX",
-            data=st.session_state.docx_bytes,
-            file_name=st.session_state.docx_name,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key="dl_docx",
-        )
-    with c2:
-        if st.session_state.audit_bytes:
-            st.download_button(
-                label="Download number audit (Excel)",
-                data=st.session_state.audit_bytes,
-                file_name=st.session_state.audit_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_audit",
-            )
-    with c3:
-        if st.session_state.dealer_zip_bytes:
-            st.download_button(
-                label="Download individual dealers (ZIP)",
-                data=st.session_state.dealer_zip_bytes,
-                file_name=st.session_state.dealer_zip_name,
-                mime="application/zip",
-                key="dl_dealers",
-            )
+    _render_results()
 
 
 if __name__ == "__main__":
