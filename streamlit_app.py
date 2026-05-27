@@ -374,7 +374,8 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
                 body_paragraphs=[
                     (
                         f"Attached is your PromptPath report for "
-                        f"<strong>{html_lib.escape(store_display)}</strong>."
+                        f"<strong>{html_lib.escape(store_display)}</strong> "
+                        f"covering {html_lib.escape(period_label)}."
                     )
                 ],
                 include_logo=include_logo,

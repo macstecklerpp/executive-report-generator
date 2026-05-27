@@ -410,6 +410,11 @@ def set_col_widths(table, ws):
                 tcPr.append(tcW)
 
 
+def _apply_cant_split(table) -> None:
+    for row in table.rows:
+        row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
+
+
 def section_heading(doc, text, sb=14):
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(sb)
@@ -1015,6 +1020,7 @@ def generate_report(config: ReportConfig) -> str:
                         tc_=tc_,
                     )
         set_col_widths(t, cw)
+        _apply_cant_split(t)
 
     def kgp(doc):
         section_heading(doc, "Key Group Performance", sb=14)
@@ -1062,6 +1068,7 @@ def generate_report(config: ReportConfig) -> str:
             cell_para(row.cells[1], fmt_appt_pct_label(otr), bold=True, size=11, color=BRAND_ORANGE)
             style_cell(row.cells[2], ORANGE_LIGHT, BORDER_GRAY)
             cell_para(row.cells[2], oa_, bold=True, size=10, color=GREEN if oc_ > 0 else (RED if oc_ < 0 else MID_GRAY))
+        _apply_cant_split(t)
         set_col_widths(t, [4320, 2520, 2520])
 
     def store_bundle(doc, name):
@@ -1069,15 +1076,16 @@ def generate_report(config: ReportConfig) -> str:
         mr = [(l, "inbound", next((r for r in b if r["name"] == name), None)) for l, b, _ in ib_b]
         mr += [(l, "outbound", next((r for r in b if r["name"] == name), None)) for l, b, _ in ob_b]
         mr = [(l, c, r) for l, c, r in mr if r]
-        t = doc.add_table(rows=1 + len(mr), cols=5)
+        show_rank = ts > 1
+        headers = ["", "METRIC", "MTD", "CHANGE"] + (["RANK"] if show_rank else [])
+        alignments = (
+            [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT]
+            + [WD_ALIGN_PARAGRAPH.CENTER] * (2 + (1 if show_rank else 0))
+        )
+        t = doc.add_table(rows=1 + len(mr), cols=len(headers))
         t.style = "Table Grid"
         t.alignment = WD_TABLE_ALIGNMENT.LEFT
-        for ci, (h, al) in enumerate(
-            zip(
-                ["", "METRIC", "MTD", "CHANGE", "RANK"],
-                [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT] + [WD_ALIGN_PARAGRAPH.CENTER] * 3,
-            )
-        ):
+        for ci, (h, al) in enumerate(zip(headers, alignments)):
             c = t.rows[0].cells[ci]
             style_cell(c, BRAND_NAVY, BRAND_NAVY, top=65, bottom=65)
             cell_para(c, h, bold=True, size=8.5, color=WHITE, align=al)
@@ -1097,18 +1105,21 @@ def generate_report(config: ReportConfig) -> str:
             chg = sr["change"]
             hib = sr.get("hib", True)
             cell_para(row.cells[3], chg, size=9.5, color=dcol(chg, hib) if chg != "—" else MID_GRAY)
-            style_cell(row.cells[4], mb, BORDER_GRAY, top=55, bottom=55)
-            rank = sr.get("rank")
-            cell_para(
-                row.cells[4],
-                f"{rs(rank)} of {ts}" if rank else "—",
-                bold=bool(rank),
-                size=9,
-                color=rc(rank, ts) if rank else MID_GRAY,
-            )
-        for row in t.rows:
-            row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
-        set_col_widths(t, [400, 5040, 1800, 1440, 1160])
+            if show_rank:
+                style_cell(row.cells[4], mb, BORDER_GRAY, top=55, bottom=55)
+                rank = sr.get("rank")
+                cell_para(
+                    row.cells[4],
+                    f"{rs(rank)} of {ts}" if rank else "—",
+                    bold=bool(rank),
+                    size=9,
+                    color=rc(rank, ts) if rank else MID_GRAY,
+                )
+        _apply_cant_split(t)
+        set_col_widths(
+            t,
+            [400, 5040, 1800, 1440, 1160] if show_rank else [400, 6200, 1800, 1440],
+        )
 
     doc = Document()
     sec = doc.sections[0]
@@ -1135,10 +1146,13 @@ def generate_report(config: ReportConfig) -> str:
     hn = any(not r.get("_hp", True) for _, b, _ in ib_b for r in b if r["name"] != "Group Avg")
     note = (
         "Inbound Opportunities use unique customer counts from the CSV when available (otherwise Connected); "
-        "IB appointment set rate uses that inbound unique count as its denominator. "
-        "Outbound Opportunities still use unique counts when available (otherwise Connected); "
-        "OB appointment set rate divides outbound appointments by outbound Connected."
+        "IB appointment set rate uses that inbound unique count as its denominator."
     )
+    if not ib_only:
+        note += (
+            "  Outbound Opportunities still use unique counts when available (otherwise Connected); "
+            "OB appointment set rate divides outbound appointments by outbound Connected."
+        )
     if hn:
         note += "  Stores showing \u2014 in Change have no prior month data."
     add_run(p, note, italic=True, size=9, color=MID_GRAY)
