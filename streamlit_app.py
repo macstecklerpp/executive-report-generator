@@ -250,6 +250,8 @@ def _build_email_html(
     bullet_items: Optional[list[str]] = None,
     logo_b64: Optional[str] = None,
     include_questions_line: bool = True,
+    footer_lines: Optional[list[str]] = None,
+    sign_off: str = "Thanks, Mac",
 ) -> str:
     parts = ['<div style="font-family: Arial, sans-serif; max-width: 600px; color: #1D2D44;">']
     if logo_b64:
@@ -266,7 +268,14 @@ def _build_email_html(
         parts.append("</ul>")
     if include_questions_line:
         parts.append("<p>Let me know if you have any questions!</p>")
-    parts.append("<p>Best,<br>Macalister</p>")
+    parts.append(f"<p>{html_lib.escape(sign_off)}</p>")
+    if footer_lines:
+        email_lines = "<br>".join(html_lib.escape(line) for line in footer_lines if line.strip())
+        if email_lines:
+            parts.append(
+                '<p style="margin-top: 24px; font-size: 13px; color: #666;">'
+                f"<strong>Send to:</strong><br>{email_lines}</p>"
+            )
     parts.append("</div>")
     return "".join(parts)
 
@@ -334,9 +343,13 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
                 continue
 
             store_display = store_originals.get(safe_name, safe_name.replace("_", " "))
-            first_names = ", ".join(name for name, _email in users)
+            if len(users) > 1:
+                greeting = "Hi Team,"
+            else:
+                greeting = f"Hi {users[0][0]},"
+            recipient_emails = [email for _name, email in users if email.strip()]
             html_body = _build_email_html(
-                greeting=f"Hi {first_names},",
+                greeting=greeting,
                 body_paragraphs=[
                     (
                         f"Attached is your PromptPath report for "
@@ -344,6 +357,7 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
                     )
                 ],
                 logo_b64=logo_b64,
+                footer_lines=recipient_emails,
             )
             docx_bytes = zf.read(arcname)
             resend.Emails.send(
