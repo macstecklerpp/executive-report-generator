@@ -8,6 +8,9 @@ Run locally:
 
 from __future__ import annotations
 
+import base64
+import csv
+import html as html_lib
 import io
 import os
 import re
@@ -23,6 +26,7 @@ import streamlit as st
 try:
     import docx  # noqa: F401  # package name: python-docx
     import openpyxl  # noqa: F401
+    import resend
 except ModuleNotFoundError as e:
     st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
     st.error(f"Missing dependency: {e}")
@@ -45,6 +49,7 @@ except ModuleNotFoundError as e:
 from promptpath_exec_report_v1 import (
     LISTENED_LINE_TYPE_OPTIONS,
     ReportConfig,
+    _derive_report_strings,
     generate_dealer_reports,
     generate_report,
     normalize_store_filters,
@@ -54,6 +59,9 @@ from promptpath_exec_report_v1 import (
 )
 
 _APP_DIR = Path(__file__).resolve().parent
+_USERS_CSV_PATH = _APP_DIR / "Admin - User List - Sheet1.csv"
+_TO_ADDRESS = "macalister@promptpath.ai"
+_DEFAULT_FROM = "onboarding@resend.dev"
 
 
 def _default_logo_path() -> Optional[Path]:
@@ -158,6 +166,203 @@ def _logo_path_from_upload(uploaded: Optional[object], tmpdir: str) -> str:
         "No logo uploaded and PromptPath_Logo.png was not found beside this app. "
         "Place PromptPath_Logo.png in the project folder."
     )
+
+
+def _secret_or_env(secret_key: str, env_var: str) -> str:
+    val = os.environ.get(env_var, "").strip()
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(secret_key, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _get_resend_api_key() -> Optional[str]:
+    key = _secret_or_env("resend_api_key", "RESEND_API_KEY")
+    return key or None
+
+
+def _get_resend_from() -> str:
+    return _secret_or_env("resend_from", "RESEND_FROM") or _DEFAULT_FROM
+
+
+def _configure_resend() -> bool:
+    key = _get_resend_api_key()
+    if not key:
+        return False
+    resend.api_key = key
+    return True
+
+
+def _load_logo_b64() -> Optional[str]:
+    logo_path = _default_logo_path()
+    if logo_path is None:
+        return None
+    raw = logo_path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _safe_store_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\- ]", "_", name.strip()).strip() or "dealer"
+
+
+def _first_name(full_name: str) -> str:
+    parts = (full_name or "").strip().split()
+    return parts[0] if parts else "there"
+
+
+def _load_user_csv() -> tuple[dict[str, list[tuple[str, str]]], dict[str, str]]:
+    """Return store_users and store_originals keyed by safe store filename stem."""
+    store_users: dict[str, list[tuple[str, str]]] = {}
+    store_originals: dict[str, str] = {}
+
+    if not _USERS_CSV_PATH.is_file():
+        return store_users, store_originals
+
+    with open(_USERS_CSV_PATH, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            dealer_raw = (row.get("Dealer Name") or "").strip()
+            if not dealer_raw:
+                continue
+            full_name = (row.get("Full Name") or "").strip()
+            email = (row.get("Email") or "").strip()
+            if not full_name:
+                continue
+
+            dealers = [d.strip() for d in dealer_raw.split(",") if d.strip()]
+            for dealer in dealers:
+                safe = _safe_store_name(dealer)
+                store_originals.setdefault(safe, dealer)
+                users = store_users.setdefault(safe, [])
+                entry = (_first_name(full_name), email)
+                if entry not in users:
+                    users.append(entry)
+
+    return store_users, store_originals
+
+
+def _build_email_html(
+    greeting: str,
+    body_paragraphs: list[str],
+    bullet_items: Optional[list[str]] = None,
+    logo_b64: Optional[str] = None,
+    include_questions_line: bool = True,
+) -> str:
+    parts = ['<div style="font-family: Arial, sans-serif; max-width: 600px; color: #1D2D44;">']
+    if logo_b64:
+        parts.append(
+            f'<p><img src="{logo_b64}" alt="PromptPath" width="200" style="display:block; margin-bottom: 16px;"></p>'
+        )
+    parts.append(f"<p>{html_lib.escape(greeting)}</p>")
+    for paragraph in body_paragraphs:
+        parts.append(f"<p>{paragraph}</p>")
+    if bullet_items:
+        parts.append("<p><strong>What's inside this report:</strong></p><ul>")
+        for item in bullet_items:
+            parts.append(f"<li>{html_lib.escape(item)}</li>")
+        parts.append("</ul>")
+    if include_questions_line:
+        parts.append("<p>Let me know if you have any questions!</p>")
+    parts.append("<p>Best,<br>Macalister</p>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _send_group_report_email(result_entry: dict[str, Any]) -> None:
+    if not result_entry.get("docx_bytes"):
+        raise ValueError("Group report DOCX is missing.")
+    if not _configure_resend():
+        raise ValueError("Add resend_api_key to Streamlit secrets or RESEND_API_KEY env var.")
+
+    group_name = result_entry["group_name"]
+    period_label = result_entry.get("period_label") or "the reporting period"
+    logo_b64 = _load_logo_b64()
+    html_body = _build_email_html(
+        greeting=f"Hi {group_name} team,",
+        body_paragraphs=[
+            f"Attached is your bi-weekly Executive Performance Report covering {html_lib.escape(period_label)}."
+        ],
+        bullet_items=[
+            "Call volume and trends vs. the prior period",
+            "Appointment set rates (hard and soft) by calls and unique customers",
+            "Customer sentiment breakdown (Delighted vs. Disappointed)",
+        ],
+        logo_b64=logo_b64,
+    )
+    attachment_name = result_entry.get("docx_name") or "PromptPath_Report.docx"
+    resend.Emails.send(
+        {
+            "from": _get_resend_from(),
+            "to": [_TO_ADDRESS],
+            "subject": f"PromptPath Executive Performance Report — {group_name} ({period_label})",
+            "html": html_body,
+            "attachments": [
+                {
+                    "filename": attachment_name,
+                    "content": base64.b64encode(result_entry["docx_bytes"]).decode("ascii"),
+                }
+            ],
+        }
+    )
+
+
+def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[str]]:
+    if not result_entry.get("zip_bytes"):
+        raise ValueError("Individual dealer ZIP is missing.")
+    if not _configure_resend():
+        raise ValueError("Add resend_api_key to Streamlit secrets or RESEND_API_KEY env var.")
+
+    store_users, store_originals = _load_user_csv()
+    period_label = result_entry.get("period_label") or "the reporting period"
+    logo_b64 = _load_logo_b64()
+    sent = 0
+    skipped = 0
+    skipped_messages: list[str] = []
+
+    with zipfile.ZipFile(io.BytesIO(result_entry["zip_bytes"])) as zf:
+        docx_names = sorted(n for n in zf.namelist() if n.lower().endswith(".docx"))
+        for arcname in docx_names:
+            safe_name = Path(arcname).stem
+            users = store_users.get(safe_name, [])
+            if not users:
+                skipped += 1
+                display = store_originals.get(safe_name, safe_name)
+                skipped_messages.append(f"No users found for store: {display} ({arcname})")
+                continue
+
+            store_display = store_originals.get(safe_name, safe_name.replace("_", " "))
+            first_names = ", ".join(name for name, _email in users)
+            html_body = _build_email_html(
+                greeting=f"Hi {first_names},",
+                body_paragraphs=[
+                    (
+                        f"Attached is your PromptPath report for "
+                        f"<strong>{html_lib.escape(store_display)}</strong>."
+                    )
+                ],
+                logo_b64=logo_b64,
+            )
+            docx_bytes = zf.read(arcname)
+            resend.Emails.send(
+                {
+                    "from": _get_resend_from(),
+                    "to": [_TO_ADDRESS],
+                    "subject": f"PromptPath Report — {store_display} ({period_label})",
+                    "html": html_body,
+                    "attachments": [
+                        {
+                            "filename": Path(arcname).name,
+                            "content": base64.b64encode(docx_bytes).decode("ascii"),
+                        }
+                    ],
+                }
+            )
+            sent += 1
+
+    return sent, skipped, skipped_messages
 
 
 def _snapshot_upload(upload: Optional[object]) -> bytes:
@@ -290,6 +495,9 @@ def _error_result(group_name: str, message: str) -> dict[str, Any]:
         "audit_name": None,
         "zip_bytes": None,
         "zip_name": None,
+        "period_label": None,
+        "period_start": None,
+        "period_end": None,
         "error": message,
     }
 
@@ -364,6 +572,10 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
         zip_bytes = None
         zip_name = None
 
+    period_start = cfg["period_start"].strftime("%Y-%m-%d")
+    period_end = cfg["period_end"].strftime("%Y-%m-%d")
+    period_label, _gen_date = _derive_report_strings(period_start, period_end)
+
     return {
         "group_name": display_name,
         "docx_bytes": docx_bytes,
@@ -372,6 +584,9 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
         "audit_name": audit_name if audit_bytes else None,
         "zip_bytes": zip_bytes,
         "zip_name": zip_name,
+        "period_label": period_label,
+        "period_start": period_start,
+        "period_end": period_end,
         "error": None,
     }
 
@@ -544,6 +759,36 @@ def _render_results() -> None:
                         mime="application/zip",
                         key=f"dl_zip_{i}_{entry['group_name']}",
                     )
+
+            st.markdown("**Email delivery**")
+            email_key = f"{i}_{entry['group_name']}"
+            if entry.get("docx_bytes"):
+                if st.button("Send Group Report", key=f"send_group_{email_key}"):
+                    if not _get_resend_api_key():
+                        st.error("Add resend_api_key to Streamlit secrets or RESEND_API_KEY env var.")
+                    else:
+                        try:
+                            with st.spinner("Sending group report..."):
+                                _send_group_report_email(entry)
+                            st.success(f"Group report sent to {_TO_ADDRESS}.")
+                        except Exception as e:
+                            st.error(f"Group report send failed: {e}")
+
+            if entry.get("zip_bytes"):
+                if st.button("Send Individual Emails", key=f"send_indiv_{email_key}"):
+                    if not _get_resend_api_key():
+                        st.error("Add resend_api_key to Streamlit secrets or RESEND_API_KEY env var.")
+                    else:
+                        try:
+                            with st.spinner("Sending individual emails..."):
+                                sent, skipped, skipped_msgs = _send_dealer_emails(entry)
+                            st.success(f"Sent {sent} individual email(s) to {_TO_ADDRESS}.")
+                            if skipped_msgs:
+                                st.warning(
+                                    f"{skipped} store(s) skipped:\n" + "\n".join(f"- {m}" for m in skipped_msgs)
+                                )
+                        except Exception as e:
+                            st.error(f"Individual email send failed: {e}")
 
 
 def main() -> None:
