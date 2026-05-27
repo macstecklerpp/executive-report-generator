@@ -220,6 +220,8 @@ class ReportConfig:
     store_filter: Union[None, str, List[str]] = None
     # UI-selected line types for the listener sentence under Calls Processed by Department.
     listened_lines: List[str] = field(default_factory=list)
+    # True for per-dealer DOCX from generate_dealer_reports (omit dept Group Total, etc.).
+    single_store_report: bool = False
 
 
 # Canonical labels for Streamlit multiselect and DOCX sentence (single source of truth).
@@ -261,9 +263,13 @@ def normalize_store_filters(value: Union[None, str, Sequence[str]]) -> Optional[
     return out or None
 
 
-def store_matches_filters(store_name: str, filters: Optional[List[str]]) -> bool:
+def store_matches_filters(
+    store_name: str, filters: Optional[List[str]], *, exact: bool = False
+) -> bool:
     if not filters:
         return True
+    if exact:
+        return store_name in filters
     return any(part in store_name for part in filters)
 
 
@@ -701,7 +707,8 @@ def generate_report(config: ReportConfig) -> str:
     dl_curr, dl_prev = _load_department_tables(config.dept_csv_path)
 
     sf = normalize_store_filters(config.store_filter)
-    sn = [s for s in dd if store_matches_filters(s, sf)]
+    exact_store = config.single_store_report
+    sn = [s for s in dd if store_matches_filters(s, sf, exact=exact_store)]
     sn.sort(key=lambda s: dd[s].get("curr_ib_calls", 0), reverse=True)
     ts = len(sn)
 
@@ -961,7 +968,7 @@ def generate_report(config: ReportConfig) -> str:
         if not ib_only:
             gt["dials"] = oc_d.get("ob_dials", 0)
             gt["dials_prev"] = sum(dd[n].get("prev_ob_dials", 0) for n in sn)
-        ar = rd + ([gt] if len(sn) > 1 else [])
+        ar = rd + ([gt] if len(rd) > 1 and not config.single_store_report else [])
         nc = len(dc)
         t = doc.add_table(rows=2 + len(ar), cols=nc)
         t.style = "Table Grid"
@@ -1260,7 +1267,12 @@ def generate_dealer_reports(config: ReportConfig, output_dir: str) -> List[str]:
     for dealer in dealers:
         safe = re.sub(r"[^A-Za-z0-9_\- ]", "_", dealer).strip() or "dealer"
         out_path = str(Path(output_dir) / f"{safe}.docx")
-        dealer_cfg = replace(config, store_filter=dealer, output_path=out_path)
+        dealer_cfg = replace(
+            config,
+            store_filter=dealer,
+            output_path=out_path,
+            single_store_report=True,
+        )
         generate_report(dealer_cfg)
         paths.append(out_path)
     return paths
