@@ -961,7 +961,7 @@ def generate_report(config: ReportConfig) -> str:
         if not ib_only:
             gt["dials"] = oc_d.get("ob_dials", 0)
             gt["dials_prev"] = sum(dd[n].get("prev_ob_dials", 0) for n in sn)
-        ar = rd + [gt]
+        ar = rd + ([gt] if len(sn) > 1 else [])
         nc = len(dc)
         t = doc.add_table(rows=2 + len(ar), cols=nc)
         t.style = "Table Grid"
