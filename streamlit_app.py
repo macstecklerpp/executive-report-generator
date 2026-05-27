@@ -62,6 +62,7 @@ _APP_DIR = Path(__file__).resolve().parent
 _USERS_CSV_PATH = _APP_DIR / "Admin - User List - Sheet1.csv"
 _TO_ADDRESS = "macalister@promptpath.ai"
 _DEFAULT_FROM = "onboarding@resend.dev"
+_LOGO_CID = "promptpath-logo"
 
 
 def _default_logo_path() -> Optional[Path]:
@@ -195,13 +196,32 @@ def _configure_resend() -> bool:
     return True
 
 
-def _load_logo_b64() -> Optional[str]:
+def _load_logo_bytes() -> Optional[bytes]:
     logo_path = _default_logo_path()
     if logo_path is None:
         return None
-    raw = logo_path.read_bytes()
-    encoded = base64.b64encode(raw).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    return logo_path.read_bytes()
+
+
+def _logo_inline_attachment() -> Optional[dict[str, Any]]:
+    raw = _load_logo_bytes()
+    if raw is None:
+        return None
+    return {
+        "filename": "PromptPath_Logo.png",
+        "content": base64.b64encode(raw).decode("ascii"),
+        "content_type": "image/png",
+        "content_id": _LOGO_CID,
+    }
+
+
+def _build_email_attachments(*file_attachments: dict[str, Any]) -> list[dict[str, Any]]:
+    attachments: list[dict[str, Any]] = []
+    logo = _logo_inline_attachment()
+    if logo:
+        attachments.append(logo)
+    attachments.extend(file_attachments)
+    return attachments
 
 
 def _safe_store_name(name: str) -> str:
@@ -248,15 +268,16 @@ def _build_email_html(
     greeting: str,
     body_paragraphs: list[str],
     bullet_items: Optional[list[str]] = None,
-    logo_b64: Optional[str] = None,
+    include_logo: bool = False,
     include_questions_line: bool = True,
     footer_lines: Optional[list[str]] = None,
     sign_off: str = "Thanks, Mac",
 ) -> str:
     parts = ['<div style="font-family: Arial, sans-serif; max-width: 600px; color: #1D2D44;">']
-    if logo_b64:
+    if include_logo:
         parts.append(
-            f'<p><img src="{logo_b64}" alt="PromptPath" width="200" style="display:block; margin-bottom: 16px;"></p>'
+            f'<p><img src="cid:{_LOGO_CID}" alt="PromptPath" width="200" '
+            'style="display:block; margin-bottom: 16px;"></p>'
         )
     parts.append(f"<p>{html_lib.escape(greeting)}</p>")
     for paragraph in body_paragraphs:
@@ -288,7 +309,7 @@ def _send_group_report_email(result_entry: dict[str, Any]) -> None:
 
     group_name = result_entry["group_name"]
     period_label = result_entry.get("period_label") or "the reporting period"
-    logo_b64 = _load_logo_b64()
+    include_logo = _logo_inline_attachment() is not None
     html_body = _build_email_html(
         greeting=f"Hi {group_name} team,",
         body_paragraphs=[
@@ -299,7 +320,7 @@ def _send_group_report_email(result_entry: dict[str, Any]) -> None:
             "Appointment set rates (hard and soft) by calls and unique customers",
             "Customer sentiment breakdown (Delighted vs. Disappointed)",
         ],
-        logo_b64=logo_b64,
+        include_logo=include_logo,
     )
     attachment_name = result_entry.get("docx_name") or "PromptPath_Report.docx"
     resend.Emails.send(
@@ -308,12 +329,12 @@ def _send_group_report_email(result_entry: dict[str, Any]) -> None:
             "to": [_TO_ADDRESS],
             "subject": f"PromptPath Executive Performance Report — {group_name} ({period_label})",
             "html": html_body,
-            "attachments": [
+            "attachments": _build_email_attachments(
                 {
                     "filename": attachment_name,
                     "content": base64.b64encode(result_entry["docx_bytes"]).decode("ascii"),
                 }
-            ],
+            ),
         }
     )
 
@@ -326,7 +347,7 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
 
     store_users, store_originals = _load_user_csv()
     period_label = result_entry.get("period_label") or "the reporting period"
-    logo_b64 = _load_logo_b64()
+    include_logo = _logo_inline_attachment() is not None
     sent = 0
     skipped = 0
     skipped_messages: list[str] = []
@@ -356,7 +377,7 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
                         f"<strong>{html_lib.escape(store_display)}</strong>."
                     )
                 ],
-                logo_b64=logo_b64,
+                include_logo=include_logo,
                 footer_lines=recipient_emails,
             )
             docx_bytes = zf.read(arcname)
@@ -366,12 +387,12 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
                     "to": [_TO_ADDRESS],
                     "subject": f"PromptPath Report — {store_display} ({period_label})",
                     "html": html_body,
-                    "attachments": [
+                    "attachments": _build_email_attachments(
                         {
                             "filename": Path(arcname).name,
                             "content": base64.b64encode(docx_bytes).decode("ascii"),
                         }
-                    ],
+                    ),
                 }
             )
             sent += 1
