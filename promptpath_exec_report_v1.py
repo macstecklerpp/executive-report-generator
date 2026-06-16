@@ -52,8 +52,8 @@ from docx.oxml import OxmlElement
 #  CONFIG (CLI defaults)
 # ══════════════════════════════════════════════════════════════════════════════
 GROUP_NAME = "Dealer Group Name"
-PERIOD_START = "2025-04-01"
-PERIOD_END = "2025-04-28"
+PERIOD_START = "2026-05-01"
+PERIOD_END = "2026-05-15"
 
 IB_CSV_PATH = "inbound.csv"
 OB_CSV_PATH = "outbound.csv"
@@ -283,6 +283,22 @@ def _derive_report_strings(period_start: str, period_end: str) -> tuple[str, str
     )
     gen_date = e.strftime("%B %-d, %Y")
     return report_period, gen_date
+
+
+def report_output_basename(dealer_or_group_name: str, period_start: str, period_end: str) -> str:
+    """Filesystem-safe stem: {dealer}_{daterange}_promptpath_executive_report."""
+    slug = re.sub(r"[^a-z0-9]+", "_", dealer_or_group_name.lower().strip()).strip("_") or "dealer"
+    s = datetime.strptime(period_start, "%Y-%m-%d")
+    e = datetime.strptime(period_end, "%Y-%m-%d")
+    sm = s.strftime("%b").lower()
+    em = e.strftime("%b").lower()
+    if s.month == e.month and s.year == e.year:
+        date_slug = f"{sm}{s.day}-{em}{e.day}_{s.year}"
+    elif s.year == e.year:
+        date_slug = f"{sm}{s.day}-{em}{e.day}_{s.year}"
+    else:
+        date_slug = f"{sm}{s.day}_{s.year}-{em}{e.day}_{e.year}"
+    return f"{slug}_{date_slug}_promptpath_executive_report"
 
 
 def _hex(c): return f"{c[0]:02X}{c[1]:02X}{c[2]:02X}"
@@ -1271,8 +1287,8 @@ def generate_dealer_reports(config: ReportConfig, output_dir: str) -> List[str]:
     dealers = _filtered_sorted_store_names(config)
     paths: List[str] = []
     for dealer in dealers:
-        safe = re.sub(r"[^A-Za-z0-9_\- ]", "_", dealer).strip() or "dealer"
-        out_path = str(Path(output_dir) / f"{safe}.docx")
+        stem = report_output_basename(dealer, config.period_start, config.period_end)
+        out_path = str(Path(output_dir) / f"{stem}.docx")
         dealer_cfg = replace(
             config,
             store_filter=dealer,

@@ -53,6 +53,7 @@ from promptpath_exec_report_v1 import (
     generate_dealer_reports,
     generate_report,
     normalize_store_filters,
+    report_output_basename,
     validate_dept_csv,
     validate_inbound_csv,
     validate_outbound_csv,
@@ -339,6 +340,23 @@ def _send_group_report_email(result_entry: dict[str, Any]) -> None:
     )
 
 
+def _store_key_for_docx_stem(
+    stem: str,
+    store_users: dict[str, list[tuple[str, str]]],
+    store_originals: dict[str, str],
+    period_start: Optional[str],
+    period_end: Optional[str],
+) -> Optional[str]:
+    """Map a ZIP .docx stem to the user CSV store key (supports new dated filenames)."""
+    if period_start and period_end:
+        for safe, original in store_originals.items():
+            if report_output_basename(original, period_start, period_end) == stem:
+                return safe
+    if stem in store_users:
+        return stem
+    return None
+
+
 def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[str]]:
     if not result_entry.get("zip_bytes"):
         raise ValueError("Individual dealer ZIP is missing.")
@@ -347,6 +365,8 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
 
     store_users, store_originals = _load_user_csv()
     period_label = result_entry.get("period_label") or "the reporting period"
+    period_start = result_entry.get("period_start")
+    period_end = result_entry.get("period_end")
     include_logo = _logo_inline_attachment() is not None
     sent = 0
     skipped = 0
@@ -355,15 +375,21 @@ def _send_dealer_emails(result_entry: dict[str, Any]) -> tuple[int, int, list[st
     with zipfile.ZipFile(io.BytesIO(result_entry["zip_bytes"])) as zf:
         docx_names = sorted(n for n in zf.namelist() if n.lower().endswith(".docx"))
         for arcname in docx_names:
-            safe_name = Path(arcname).stem
-            users = store_users.get(safe_name, [])
+            safe_name = _store_key_for_docx_stem(
+                Path(arcname).stem,
+                store_users,
+                store_originals,
+                period_start,
+                period_end,
+            )
+            users = store_users.get(safe_name or "", [])
             if not users:
                 skipped += 1
-                display = store_originals.get(safe_name, safe_name)
+                display = store_originals.get(safe_name or "", Path(arcname).stem)
                 skipped_messages.append(f"No users found for store: {display} ({arcname})")
                 continue
 
-            store_display = store_originals.get(safe_name, safe_name.replace("_", " "))
+            store_display = store_originals.get(safe_name or "", Path(arcname).stem.replace("_", " "))
             if len(users) > 1:
                 greeting = "Hi Team,"
             else:
@@ -421,11 +447,10 @@ def _empty_group(gid: int) -> dict[str, Any]:
     return {
         "id": gid,
         "group_name": "",
-        "period_start": date(2025, 4, 1),
-        "period_end": date(2025, 4, 28),
+        "period_start": date(2026, 5, 1),
+        "period_end": date(2026, 5, 15),
         "ib_only": False,
         "store_filter": "",
-        "out_name": "PromptPath_Report.docx",
         "listened_lines": list(LISTENED_LINE_TYPE_OPTIONS),
         "ib_blob": b"",
         "ob_blob": b"",
@@ -452,11 +477,10 @@ def _init_group_widgets(g: dict[str, Any]) -> None:
     gid = g["id"]
     defaults: dict[str, Any] = {
         f"pp_g{gid}_group_name": g.get("group_name", ""),
-        f"pp_g{gid}_period_start": g.get("period_start", date(2025, 4, 1)),
-        f"pp_g{gid}_period_end": g.get("period_end", date(2025, 4, 28)),
+        f"pp_g{gid}_period_start": g.get("period_start", date(2026, 5, 1)),
+        f"pp_g{gid}_period_end": g.get("period_end", date(2026, 5, 15)),
         f"pp_g{gid}_ib_only": g.get("ib_only", False),
         f"pp_g{gid}_store_filter": g.get("store_filter", ""),
-        f"pp_g{gid}_out_name": g.get("out_name", "PromptPath_Report.docx"),
         f"pp_g{gid}_listened_lines": g.get("listened_lines", list(LISTENED_LINE_TYPE_OPTIONS)),
     }
     for key, val in defaults.items():
@@ -498,7 +522,6 @@ def _read_group_inputs(g: dict[str, Any]) -> dict[str, Any]:
         "period_end": st.session_state.get(f"pp_g{gid}_period_end"),
         "ib_only": ib_only,
         "store_filter_raw": str(st.session_state.get(f"pp_g{gid}_store_filter", "")),
-        "out_name": str(st.session_state.get(f"pp_g{gid}_out_name", "PromptPath_Report.docx")),
         "listened_lines": list(st.session_state.get(f"pp_g{gid}_listened_lines", [])),
         "ib_blob": ib_blob,
         "ob_blob": ob_blob,
@@ -542,7 +565,9 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
     group_name = cfg["group_name"]
     display_name = group_name or f"Group {cfg['id']}"
     store_filter = normalize_store_filters(cfg["store_filter_raw"])
-    out_fn = _safe_docx_name(cfg["out_name"])
+    period_start = cfg["period_start"].strftime("%Y-%m-%d")
+    period_end = cfg["period_end"].strftime("%Y-%m-%d")
+    out_fn = _safe_docx_name(f"{report_output_basename(group_name, period_start, period_end)}.docx")
 
     tmpdir = tempfile.mkdtemp(prefix="pp_report_")
     ib_path = os.path.join(tmpdir, "inbound.csv")
@@ -568,8 +593,8 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
 
     report_cfg = ReportConfig(
         group_name=group_name,
-        period_start=cfg["period_start"].strftime("%Y-%m-%d"),
-        period_end=cfg["period_end"].strftime("%Y-%m-%d"),
+        period_start=period_start,
+        period_end=period_end,
         ib_csv_path=ib_path,
         ob_csv_path=ob_path_opt,
         dept_csv_path=dept_path,
@@ -608,8 +633,6 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
         zip_bytes = None
         zip_name = None
 
-    period_start = cfg["period_start"].strftime("%Y-%m-%d")
-    period_end = cfg["period_end"].strftime("%Y-%m-%d")
     period_label, _gen_date = _derive_report_strings(period_start, period_end)
 
     return {
@@ -697,8 +720,6 @@ def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
                 "A store is included if its name matches any of these (OR)."
             ),
         )
-
-        st.text_input("Output filename", key=f"pp_g{gid}_out_name")
 
         ib_key = f"pp_g{gid}_ib_csv"
         ob_key = f"pp_g{gid}_ob_csv"
