@@ -777,7 +777,13 @@ def generate_report(config: ReportConfig) -> str:
         lambda d, p: fs(d.get(p + "disappointed", 0), d.get(p + "ib_calls", 1)),
         hib=False,
     )
+    ibcr = build(
+        lambda d: pct(d.get("curr_connected", 0), d.get("curr_ib_calls", 1)),
+        lambda d: pct(d.get("prev_connected", 0), d.get("prev_ib_calls", 1)) if d.get("prev_ib_calls") else None,
+        lambda d, p: f"{pct(d.get(p + 'connected', 0), d.get(p + 'ib_calls', 1))}%",
+    )
     ib_b = [
+        ("IB Connect Rate", ibcr, "inbound"),
         ("Opportunities", ibc, "inbound"),
         ("Appts Set (% hard)", iba, "inbound"),
         ("Appt Set Rate", ibr, "inbound"),
