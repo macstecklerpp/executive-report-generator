@@ -787,6 +787,19 @@ def generate_report(config: ReportConfig) -> str:
     dl_prev = data.dl_prev
     sn = data.sn
     ts = len(sn)
+
+    # KGP rollup — computed from the filtered sn list so a store filter correctly
+    # scopes the aggregate rates shown at the top of the report.  When no filter is
+    # applied sn contains every store and the sums match the "All Dealers" CSV row.
+    kgp_iu = sum(dd[n].get("curr_ib_unique_opps", 0) for n in sn)
+    kgp_ia = sum(dd[n].get("curr_total_appts", 0) for n in sn)
+    kgp_iu_p = sum(dd[n].get("prev_ib_unique_opps", 0) for n in sn)
+    kgp_ia_p = sum(dd[n].get("prev_total_appts", 0) for n in sn)
+    kgp_ou = sum(dd[n].get("curr_ob_connected", 0) for n in sn)
+    kgp_ota = sum(dd[n].get("curr_ob_total_appts", 0) for n in sn)
+    kgp_ou_p = sum(dd[n].get("prev_ob_connected", 0) for n in sn)
+    kgp_ota_p = sum(dd[n].get("prev_ob_total_appts", 0) for n in sn)
+
     ib = data.ib
     ob = data.ob
     ib_opp_col = data.ib_opp_col
@@ -1119,10 +1132,10 @@ def generate_report(config: ReportConfig) -> str:
 
     def kgp(doc):
         section_heading(doc, "Key Group Performance", sb=14)
-        iu = ac.get("ib_unique_opps", 0)
-        ia = ac.get("total_appts", 0)
+        iu = kgp_iu
+        ia = kgp_ia
         ir = pct_appt_rate(ia, iu)
-        pr = pct_appt_rate(ap.get("total_appts", 0), ap.get("ib_unique_opps", 0))
+        pr = pct_appt_rate(kgp_ia_p, kgp_iu_p)
         ic_ = round(ir - pr, 1)
         ia_ = f"{'▲' if ic_ > 0 else '▼' if ic_ < 0 else '—'} {'+' if ic_ > 0 else ''}{ic_}pp" if ic_ != 0 else "—"
         nr = 2 if ib_only else 3
@@ -1149,10 +1162,10 @@ def generate_report(config: ReportConfig) -> str:
         style_cell(row.cells[2], LIGHT_BLUE, BORDER_GRAY)
         cell_para(row.cells[2], ia_, bold=True, size=10, color=GREEN if ic_ > 0 else (RED if ic_ < 0 else MID_GRAY))
         if not ib_only:
-            ou = oc_d.get("ob_connected", 0)
-            ota = oc_d.get("ob_total_appts", 0)
+            ou = kgp_ou
+            ota = kgp_ota
             otr = pct_appt_rate(ota, ou)
-            opr = pct_appt_rate(op_d.get("ob_total_appts", 0), op_d.get("ob_connected", 0))
+            opr = pct_appt_rate(kgp_ota_p, kgp_ou_p)
             oc_ = round(otr - opr, 1)
             oa_ = f"{'▲' if oc_ > 0 else '▼' if oc_ < 0 else '—'} {'+' if oc_ > 0 else ''}{oc_}pp" if oc_ != 0 else "—"
             row = t.rows[2]
