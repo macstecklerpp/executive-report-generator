@@ -251,7 +251,7 @@ def build_user_message(data_brief: str, report_text: str) -> str:
 
 # ── OpenAI call ───────────────────────────────────────────────────────────────
 
-def generate_script(api_key: str, user_message: str, model: str = "gpt-4.1") -> str:
+def generate_script(api_key: str, user_message: str, model: str = "gpt-5.5") -> str:
     """Call OpenAI and return the plain spoken-prose PromptCast script."""
     from openai import OpenAI  # imported here so the module loads without openai installed
 
