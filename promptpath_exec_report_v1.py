@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import calendar
 import csv
 import re
 from dataclasses import dataclass, field, replace
@@ -222,6 +223,25 @@ class ReportConfig:
     listened_lines: List[str] = field(default_factory=list)
     # True for per-dealer DOCX from generate_dealer_reports (omit dept Group Total, etc.).
     single_store_report: bool = False
+
+
+@dataclass
+class ReportData:
+    """All CSV-derived data needed to render a report or build a PromptCast brief."""
+    dd: Dict[str, Dict[str, Any]]          # per-dealer metrics
+    ac: Dict[str, Any]                     # All Dealers current (inbound rollup)
+    ap: Dict[str, Any]                     # All Dealers previous (inbound rollup)
+    oc_d: Dict[str, Any]                   # All Dealers current (outbound rollup)
+    op_d: Dict[str, Any]                   # All Dealers previous (outbound rollup)
+    dl_curr: Dict[str, Dict[str, int]]     # department call counts, current
+    dl_prev: Dict[str, Dict[str, int]]     # department call counts, previous
+    sn: List[str]                          # sorted filtered store names
+    ib: List[Dict[str, str]]               # raw inbound CSV rows
+    ob: List[Dict[str, str]]               # raw outbound CSV rows
+    ib_opp_col: str
+    ob_opp_col: Optional[str]
+    ob_connected_col: str
+    inbound_soft_col: bool
 
 
 # Canonical labels for Streamlit multiselect and DOCX sentence (single source of truth).
@@ -601,10 +621,8 @@ def validate_dept_csv(path: str) -> None:
         )
 
 
-def generate_report(config: ReportConfig) -> str:
-    """Build the DOCX at config.output_path and return that path."""
-    report_period, gen_date = _derive_report_strings(config.period_start, config.period_end)
-    group_name = config.group_name
+def load_report_data(config: ReportConfig) -> ReportData:
+    """Parse all CSVs and return aggregated data used by generate_report and promptcast."""
     ib_only = config.ib_only
 
     with open(config.ib_csv_path, newline="", encoding="utf-8") as f:
@@ -640,7 +658,7 @@ def generate_report(config: ReportConfig) -> str:
         d[px + "delighted"] = si(row["Delighted"])
         d[px + "disappointed"] = si(row["Disappointed"])
 
-    def pib(row):
+    def _pib(row):
         if not row:
             return {}
         tot = si(row["Total Appts"])
@@ -663,8 +681,8 @@ def generate_report(config: ReportConfig) -> str:
             ]
         } | {"soft_appts": soft, "ib_unique_opps": opp}
 
-    ac = pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
-    ap = pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
+    ac = _pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
+    ap = _pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
     for roll in (ac, ap):
         if roll:
             roll["curr_ib_unique_opps"] = roll.get("ib_unique_opps", 0)
@@ -700,7 +718,7 @@ def generate_report(config: ReportConfig) -> str:
             d[px + "ob_hard_appts"] = h_ob
             d[px + "ob_soft_appts"] = s_ob
 
-        def pob(row):
+        def _pob(row):
             if not row:
                 return {}
             h_ob = si(row["Hard Appt"])
@@ -714,8 +732,8 @@ def generate_report(config: ReportConfig) -> str:
                 "ob_soft_appts": s_ob,
             }
 
-        oc_d = pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
-        op_d = pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
+        oc_d = _pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
+        op_d = _pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
         for roll in (oc_d, op_d):
             if roll:
                 roll["curr_ob_unique_opps"] = roll.get("ob_unique_opps", 0)
@@ -726,7 +744,55 @@ def generate_report(config: ReportConfig) -> str:
     exact_store = config.single_store_report
     sn = [s for s in dd if store_matches_filters(s, sf, exact=exact_store)]
     sn.sort(key=lambda s: dd[s].get("curr_ib_calls", 0), reverse=True)
+
+    return ReportData(
+        dd=dd, ac=ac, ap=ap, oc_d=oc_d, op_d=op_d,
+        dl_curr=dl_curr, dl_prev=dl_prev, sn=sn,
+        ib=ib, ob=ob, ib_opp_col=ib_opp_col,
+        ob_opp_col=ob_opp_col, ob_connected_col=ob_connected_col,
+        inbound_soft_col=inbound_soft_col,
+    )
+
+
+def derive_comparison_period_label(period_start: str, period_end: str) -> str:
+    """Shift the report period one calendar month earlier for the comparison label."""
+    s = datetime.strptime(period_start, "%Y-%m-%d")
+    e = datetime.strptime(period_end, "%Y-%m-%d")
+    cs_month = s.month - 1 if s.month > 1 else 12
+    cs_year = s.year if s.month > 1 else s.year - 1
+    ce_month = e.month - 1 if e.month > 1 else 12
+    ce_year = e.year if e.month > 1 else e.year - 1
+    cs_day = min(s.day, calendar.monthrange(cs_year, cs_month)[1])
+    ce_day = min(e.day, calendar.monthrange(ce_year, ce_month)[1])
+    cs = s.replace(year=cs_year, month=cs_month, day=cs_day)
+    ce = e.replace(year=ce_year, month=ce_month, day=ce_day)
+    if cs.month == ce.month and cs.year == ce.year:
+        return f"{cs.strftime('%B %-d')} \u2013 {ce.strftime('%-d, %Y')}"
+    return f"{cs.strftime('%B %-d')} \u2013 {ce.strftime('%B %-d, %Y')}"
+
+
+def generate_report(config: ReportConfig) -> str:
+    """Build the DOCX at config.output_path and return that path."""
+    report_period, gen_date = _derive_report_strings(config.period_start, config.period_end)
+    group_name = config.group_name
+    ib_only = config.ib_only
+
+    data = load_report_data(config)
+    dd = data.dd
+    ac = data.ac
+    ap = data.ap
+    oc_d = data.oc_d
+    op_d = data.op_d
+    dl_curr = data.dl_curr
+    dl_prev = data.dl_prev
+    sn = data.sn
     ts = len(sn)
+    ib = data.ib
+    ob = data.ob
+    ib_opp_col = data.ib_opp_col
+    ob_opp_col = data.ob_opp_col
+    ob_connected_col = data.ob_connected_col
+    inbound_soft_col = data.inbound_soft_col
 
     def build(mf, pf, df, hib=True):
         rows = []
@@ -1211,70 +1277,7 @@ def generate_report(config: ReportConfig) -> str:
 
 def _filtered_sorted_store_names(config: ReportConfig) -> List[str]:
     """Same dealer ordering as generate_report (filters + sort by current inbound calls)."""
-    ib_only = config.ib_only
-    with open(config.ib_csv_path, newline="", encoding="utf-8") as f:
-        ib = list(csv.DictReader(f))
-
-    inbound_soft_col = bool(ib and ib[0] is not None and "Soft Appt" in ib[0])
-    _ib_fields = list(ib[0].keys()) if ib else []
-    ib_opp_col = _first_matching_col(_ib_fields, IB_UNIQUE_OPP_COLUMNS) or "Connected"
-
-    dd: Dict[str, Dict[str, Any]] = {}
-    for row in ib:
-        dn = row["Dealerships"].strip()
-        pe = row["Period"].strip()
-        if dn == "All Dealers":
-            continue
-        if dn not in dd:
-            dd[dn] = {}
-        d = dd[dn]
-        px = "curr_" if pe == "Current" else "prev_"
-        tot = si(row["Total Appts"])
-        hard = si(row["Hard Appt"])
-        if inbound_soft_col:
-            raw_s = str(row.get("Soft Appt", "")).strip()
-            soft = si(raw_s) if raw_s != "" else max(0, tot - hard)
-        else:
-            soft = max(0, tot - hard)
-        d[px + "ib_calls"] = si(row["Inbound Calls"])
-        d[px + "connected"] = si(row["Connected"])
-        d[px + "ib_unique_opps"] = si(row[ib_opp_col])
-        d[px + "total_appts"] = tot
-        d[px + "hard_appts"] = hard
-        d[px + "soft_appts"] = soft
-        d[px + "delighted"] = si(row["Delighted"])
-        d[px + "disappointed"] = si(row["Disappointed"])
-
-    if not ib_only:
-        if not config.ob_csv_path:
-            raise ValueError("Outbound CSV path is required when ib_only is False.")
-        with open(config.ob_csv_path, newline="", encoding="utf-8") as f:
-            ob = list(csv.DictReader(f))
-        _ob_fields = list(ob[0].keys()) if ob else []
-        ob_connected_col = _resolve_ob_connected_column(_ob_fields) or "Connected"
-        ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or ob_connected_col
-        for row in ob:
-            dn = row["Dealerships"].strip()
-            pe = row["Period"].strip()
-            if dn == "All Dealers":
-                continue
-            if dn not in dd:
-                dd[dn] = {}
-            d = dd[dn]
-            px = "curr_" if pe == "Current" else "prev_"
-            h_ob = si(row["Hard Appt"])
-            s_ob = si(row["Soft Appt"])
-            d[px + "ob_dials"] = si(row["Outbound Dials"])
-            d[px + "ob_connected"] = si(row[ob_connected_col])
-            d[px + "ob_unique_opps"] = si(row[ob_opp_col])
-            d[px + "ob_total_appts"] = h_ob + s_ob
-            d[px + "ob_hard_appts"] = h_ob
-            d[px + "ob_soft_appts"] = s_ob
-
-    sf = normalize_store_filters(config.store_filter)
-    sn = [s for s in dd if store_matches_filters(s, sf)]
-    sn.sort(key=lambda s: dd[s].get("curr_ib_calls", 0), reverse=True)
-    return sn
+    return load_report_data(config).sn
 
 
 def generate_dealer_reports(config: ReportConfig, output_dir: str) -> List[str]:

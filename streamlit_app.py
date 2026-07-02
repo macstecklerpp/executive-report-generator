@@ -50,13 +50,22 @@ from promptpath_exec_report_v1 import (
     LISTENED_LINE_TYPE_OPTIONS,
     ReportConfig,
     _derive_report_strings,
+    derive_comparison_period_label,
     generate_dealer_reports,
     generate_report,
+    load_report_data,
     normalize_store_filters,
     report_output_basename,
     validate_dept_csv,
     validate_inbound_csv,
     validate_outbound_csv,
+)
+from promptcast import (
+    build_data_brief,
+    build_user_message,
+    extract_docx_text,
+    generate_script,
+    write_promptcast_docx,
 )
 
 _APP_DIR = Path(__file__).resolve().parent
@@ -139,6 +148,14 @@ def _maybe_sidebar_actions() -> None:
                 st.session_state._pp_authenticated = False
                 st.rerun()
 
+        st.caption("API Keys")
+        st.text_input(
+            "OpenAI API key (for PromptCast)",
+            type="password",
+            key="openai_api_key_override",
+            help="Paste your OpenAI API key here. Not stored on disk — session only.",
+        )
+
         if st.session_state.get("pp_reports"):
             st.caption("Results")
             if st.button("Clear results"):
@@ -182,6 +199,14 @@ def _secret_or_env(secret_key: str, env_var: str) -> str:
 
 def _get_resend_api_key() -> Optional[str]:
     key = _secret_or_env("resend_api_key", "RESEND_API_KEY")
+    return key or None
+
+
+def _get_openai_api_key() -> Optional[str]:
+    override = str(st.session_state.get("openai_api_key_override", "") or "").strip()
+    if override:
+        return override
+    key = _secret_or_env("openai_api_key", "OPENAI_API_KEY")
     return key or None
 
 
@@ -443,6 +468,9 @@ def _next_group_id() -> int:
     return n
 
 
+_RAMP_STATUS_OPTIONS = ["New Deployment", "Ramp Phase", "Steady State"]
+
+
 def _empty_group(gid: int) -> dict[str, Any]:
     return {
         "id": gid,
@@ -451,6 +479,8 @@ def _empty_group(gid: int) -> dict[str, Any]:
         "period_end": date(2026, 5, 15),
         "ib_only": False,
         "store_filter": "",
+        "ramp_status": "Steady State",
+        "outbound_launch_date": "early 2026",
         "listened_lines": list(LISTENED_LINE_TYPE_OPTIONS),
         "ib_blob": b"",
         "ob_blob": b"",
@@ -481,6 +511,8 @@ def _init_group_widgets(g: dict[str, Any]) -> None:
         f"pp_g{gid}_period_end": g.get("period_end", date(2026, 5, 15)),
         f"pp_g{gid}_ib_only": g.get("ib_only", False),
         f"pp_g{gid}_store_filter": g.get("store_filter", ""),
+        f"pp_g{gid}_ramp_status": g.get("ramp_status", "Steady State"),
+        f"pp_g{gid}_outbound_launch_date": g.get("outbound_launch_date", "early 2026"),
         f"pp_g{gid}_listened_lines": g.get("listened_lines", list(LISTENED_LINE_TYPE_OPTIONS)),
     }
     for key, val in defaults.items():
@@ -522,6 +554,8 @@ def _read_group_inputs(g: dict[str, Any]) -> dict[str, Any]:
         "period_end": st.session_state.get(f"pp_g{gid}_period_end"),
         "ib_only": ib_only,
         "store_filter_raw": str(st.session_state.get(f"pp_g{gid}_store_filter", "")),
+        "ramp_status": str(st.session_state.get(f"pp_g{gid}_ramp_status", "Steady State")),
+        "outbound_launch_date": str(st.session_state.get(f"pp_g{gid}_outbound_launch_date", "early 2026")),
         "listened_lines": list(st.session_state.get(f"pp_g{gid}_listened_lines", [])),
         "ib_blob": ib_blob,
         "ob_blob": ob_blob,
@@ -554,9 +588,14 @@ def _error_result(group_name: str, message: str) -> dict[str, Any]:
         "audit_name": None,
         "zip_bytes": None,
         "zip_name": None,
+        "promptcast_bytes": None,
+        "promptcast_name": None,
+        "promptcast_error": None,
         "period_label": None,
         "period_start": None,
         "period_end": None,
+        "ramp_status": None,
+        "outbound_launch_date": None,
         "error": message,
     }
 
@@ -634,6 +673,49 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
         zip_name = None
 
     period_label, _gen_date = _derive_report_strings(period_start, period_end)
+    comparison_period = derive_comparison_period_label(period_start, period_end)
+
+    # ── PromptCast script generation ──────────────────────────────────────────
+    promptcast_bytes: Optional[bytes] = None
+    promptcast_name: Optional[str] = None
+    promptcast_error: Optional[str] = None
+
+    openai_key = _get_openai_api_key()
+    if not openai_key:
+        promptcast_error = (
+            "OpenAI API key not set. Enter it in the sidebar (session-only) "
+            "or add openai_api_key to Streamlit secrets."
+        )
+    else:
+        try:
+            pc_stem = Path(out_fn).stem + "_promptcast_script"
+            pc_path = os.path.join(tmpdir, pc_stem + ".docx")
+
+            # Load data using the same config used for the executive report
+            rpt_data = load_report_data(report_cfg)
+            data_brief = build_data_brief(
+                config=report_cfg,
+                data=rpt_data,
+                ramp_status=cfg.get("ramp_status", "Steady State"),
+                outbound_launch_date=cfg.get("outbound_launch_date", "early 2026"),
+                report_period=period_label,
+                comparison_period=comparison_period,
+            )
+            report_text = extract_docx_text(out_path)
+            user_msg = build_user_message(data_brief, report_text)
+            script_text = generate_script(openai_key, user_msg)
+            write_promptcast_docx(
+                script_text=script_text,
+                output_path=pc_path,
+                group_name=group_name,
+                period_label=period_label,
+                logo_path=logo_path,
+            )
+            with open(pc_path, "rb") as f:
+                promptcast_bytes = f.read()
+            promptcast_name = pc_stem + ".docx"
+        except Exception as e:
+            promptcast_error = f"PromptCast generation failed: {e}"
 
     return {
         "group_name": display_name,
@@ -643,9 +725,14 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
         "audit_name": audit_name if audit_bytes else None,
         "zip_bytes": zip_bytes,
         "zip_name": zip_name,
+        "promptcast_bytes": promptcast_bytes,
+        "promptcast_name": promptcast_name,
+        "promptcast_error": promptcast_error,
         "period_label": period_label,
         "period_start": period_start,
         "period_end": period_end,
+        "ramp_status": cfg.get("ramp_status"),
+        "outbound_launch_date": cfg.get("outbound_launch_date"),
         "error": None,
     }
 
@@ -721,6 +808,23 @@ def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
             ),
         )
 
+        rs_col, ld_col = st.columns(2)
+        with rs_col:
+            st.selectbox(
+                "Ramp Status (PromptCast)",
+                options=_RAMP_STATUS_OPTIONS,
+                key=f"pp_g{gid}_ramp_status",
+                help="Controls which comparisons the PromptCast script is allowed to make.",
+            )
+        with ld_col:
+            ib_only_checked = bool(st.session_state.get(f"pp_g{gid}_ib_only", False))
+            st.text_input(
+                "Outbound launch date (PromptCast)",
+                key=f"pp_g{gid}_outbound_launch_date",
+                disabled=ib_only_checked,
+                help="e.g. 'early 2026'. Omitted from script when inbound-only is enabled.",
+            )
+
         ib_key = f"pp_g{gid}_ib_csv"
         ob_key = f"pp_g{gid}_ob_csv"
         dept_key = f"pp_g{gid}_dept_csv"
@@ -767,6 +871,72 @@ def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
             st.caption("Department CSV loaded.")
         if g.get("ob_blob"):
             st.caption("Outbound CSV loaded.")
+
+
+def _retry_promptcast(entry: dict[str, Any]) -> dict[str, Any]:
+    """Re-run PromptCast for an already-generated group result entry."""
+    openai_key = _get_openai_api_key()
+    if not openai_key:
+        return {"bytes": None, "name": None, "error": "OpenAI API key not set in sidebar."}
+
+    tmpdir = tempfile.mkdtemp(prefix="pp_pc_retry_")
+    try:
+        group_name = entry.get("group_name", "Group")
+        period_start = entry.get("period_start", "")
+        period_end = entry.get("period_end", "")
+        period_label = entry.get("period_label", "")
+        ramp_status = entry.get("ramp_status") or "Steady State"
+        outbound_launch_date = entry.get("outbound_launch_date") or "early 2026"
+
+        if not entry.get("docx_bytes"):
+            return {"bytes": None, "name": None, "error": "Executive report DOCX not available for retry."}
+
+        comparison_period = derive_comparison_period_label(period_start, period_end)
+
+        # Write the executive report to a temp file so extract_docx_text() can read it
+        exec_path = os.path.join(tmpdir, "exec.docx")
+        with open(exec_path, "wb") as f:
+            f.write(entry["docx_bytes"])
+
+        # Write the CSVs if available — needed to build the data brief
+        # For retry we cannot call load_report_data() (no CSVs), so we extract
+        # report text only and send a minimal brief from the period metadata.
+        report_text = extract_docx_text(exec_path)
+
+        # Build a lightweight brief from period/group info only (no CSV re-parse)
+        brief_lines = [
+            "=== GROUP / STORE INFORMATION ===",
+            f"Group / Store Name: {group_name}",
+            "Report Type: Group Level",
+            f"Report Period: {period_label}",
+            f"Comparison Period: {comparison_period}",
+            f"Ramp Status: {ramp_status}",
+            f"Outbound Launch Date: {outbound_launch_date}",
+            "Platform Benchmark: 40 to 45 percent inbound appointment set rate",
+            "",
+            "(All performance figures are in the EXECUTIVE REPORT below.)",
+        ]
+        data_brief = "\n".join(brief_lines)
+        user_msg = build_user_message(data_brief, report_text)
+        script_text = generate_script(openai_key, user_msg)
+
+        logo_path_opt = _default_logo_path()
+        logo_path = str(logo_path_opt) if logo_path_opt else ""
+
+        out_stem = report_output_basename(group_name, period_start, period_end) + "_promptcast_script"
+        pc_path = os.path.join(tmpdir, out_stem + ".docx")
+        write_promptcast_docx(
+            script_text=script_text,
+            output_path=pc_path,
+            group_name=group_name,
+            period_label=period_label,
+            logo_path=logo_path,
+        )
+        with open(pc_path, "rb") as f:
+            pc_bytes = f.read()
+        return {"bytes": pc_bytes, "name": out_stem + ".docx", "error": None}
+    except Exception as e:
+        return {"bytes": None, "name": None, "error": str(e)}
 
 
 def _render_results() -> None:
@@ -816,6 +986,38 @@ def _render_results() -> None:
                         mime="application/zip",
                         key=f"dl_zip_{i}_{entry['group_name']}",
                     )
+
+            # PromptCast script row
+            st.markdown("**PromptCast Script**")
+            pc_key = f"{i}_{entry['group_name']}"
+            pc_bytes = entry.get("promptcast_bytes")
+            pc_name = entry.get("promptcast_name")
+            pc_error = entry.get("promptcast_error")
+            if pc_bytes:
+                st.download_button(
+                    label="Download PromptCast script (.docx)",
+                    data=pc_bytes,
+                    file_name=pc_name or "promptcast_script.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"dl_pc_{pc_key}",
+                )
+            else:
+                if pc_error:
+                    st.warning(f"PromptCast: {pc_error}")
+                if st.button("Generate PromptCast Script", key=f"retry_pc_{pc_key}"):
+                    with st.spinner("Generating PromptCast script via OpenAI…"):
+                        result = _retry_promptcast(entry)
+                    if result["error"]:
+                        st.error(f"PromptCast failed: {result['error']}")
+                    else:
+                        st.success("PromptCast script ready.")
+                        st.download_button(
+                            label="Download PromptCast script (.docx)",
+                            data=result["bytes"],
+                            file_name=result["name"] or "promptcast_script.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"dl_pc_retry_{pc_key}",
+                        )
 
             st.markdown("**Email delivery**")
             email_key = f"{i}_{entry['group_name']}"
