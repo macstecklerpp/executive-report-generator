@@ -112,6 +112,7 @@ IB_UNIQUE_OPP_COLUMNS = (
     "Unique Customer Inbound",
     "Unique Customers Inbound",
     "Unique Inbound Customers",
+    "Inbound Unique Customers",   # wide leaderboard export format
     "Unique Connected",
     "Unique Customer",
     "Unique Customers",
