@@ -789,17 +789,30 @@ def generate_report(config: ReportConfig) -> str:
     sn = data.sn
     ts = len(sn)
 
-    # KGP rollup — computed from the filtered sn list so a store filter correctly
-    # scopes the aggregate rates shown at the top of the report.  When no filter is
-    # applied sn contains every store and the sums match the "All Dealers" CSV row.
-    kgp_iu = sum(dd[n].get("curr_ib_unique_opps", 0) for n in sn)
-    kgp_ia = sum(dd[n].get("curr_total_appts", 0) for n in sn)
-    kgp_iu_p = sum(dd[n].get("prev_ib_unique_opps", 0) for n in sn)
-    kgp_ia_p = sum(dd[n].get("prev_total_appts", 0) for n in sn)
-    kgp_ou = sum(dd[n].get("curr_ob_connected", 0) for n in sn)
-    kgp_ota = sum(dd[n].get("curr_ob_total_appts", 0) for n in sn)
-    kgp_ou_p = sum(dd[n].get("prev_ob_connected", 0) for n in sn)
-    kgp_ota_p = sum(dd[n].get("prev_ob_total_appts", 0) for n in sn)
+    # KGP rollup — when no store filter is active, use PromptPath's own "All Dealers"
+    # rollup rows (ac/ap/oc_d/op_d) as the source of truth, since PromptPath may
+    # deduplicate unique customers across stores at the group level. When a filter
+    # IS active, the All Dealers row reflects every store, not just the filtered
+    # ones, so we sum the filtered sn list instead to correctly scope the rates.
+    _kgp_sf = normalize_store_filters(config.store_filter)
+    if not _kgp_sf:
+        kgp_iu = ac.get("ib_unique_opps", 0)
+        kgp_ia = ac.get("total_appts", 0)
+        kgp_iu_p = ap.get("ib_unique_opps", 0)
+        kgp_ia_p = ap.get("total_appts", 0)
+        kgp_ou = oc_d.get("ob_connected", 0)
+        kgp_ota = oc_d.get("ob_total_appts", 0)
+        kgp_ou_p = op_d.get("ob_connected", 0)
+        kgp_ota_p = op_d.get("ob_total_appts", 0)
+    else:
+        kgp_iu = sum(dd[n].get("curr_ib_unique_opps", 0) for n in sn)
+        kgp_ia = sum(dd[n].get("curr_total_appts", 0) for n in sn)
+        kgp_iu_p = sum(dd[n].get("prev_ib_unique_opps", 0) for n in sn)
+        kgp_ia_p = sum(dd[n].get("prev_total_appts", 0) for n in sn)
+        kgp_ou = sum(dd[n].get("curr_ob_connected", 0) for n in sn)
+        kgp_ota = sum(dd[n].get("curr_ob_total_appts", 0) for n in sn)
+        kgp_ou_p = sum(dd[n].get("prev_ob_connected", 0) for n in sn)
+        kgp_ota_p = sum(dd[n].get("prev_ob_total_appts", 0) for n in sn)
 
     ib = data.ib
     ob = data.ob
