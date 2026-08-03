@@ -9,12 +9,14 @@ Run locally:
 from __future__ import annotations
 
 import base64
+import calendar
 import csv
 import html as html_lib
 import io
 import os
 import re
 import secrets as secrets_stdlib
+import shutil
 import tempfile
 import zipfile
 from datetime import date
@@ -26,6 +28,7 @@ import streamlit as st
 try:
     import docx  # noqa: F401  # package name: python-docx
     import openpyxl  # noqa: F401
+    import pandas as pd
     import resend
 except ModuleNotFoundError as e:
     st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
@@ -73,6 +76,10 @@ _USERS_CSV_PATH = _APP_DIR / "Admin - User List - Sheet1.csv"
 _TO_ADDRESS = "macalister@promptpath.ai"
 _DEFAULT_FROM = "onboarding@resend.dev"
 _LOGO_CID = "promptpath-logo"
+
+_DEALER_GROUPS_CSV_PATH = _APP_DIR / "dealer_groups.csv"
+_SEED_DEALER_GROUPS_CSV_PATH = _APP_DIR / "Onboarding Big Rocks - Sheet4.csv"
+_DEALER_GROUPS_CSV_HEADER = ["Dealer Group", "Dealer Filters"]
 
 
 def _default_logo_path() -> Optional[Path]:
@@ -290,6 +297,60 @@ def _load_user_csv() -> tuple[dict[str, list[tuple[str, str]]], dict[str, str]]:
     return store_users, store_originals
 
 
+def _slugify_group_id(name: str) -> str:
+    """Stable, filesystem/session-state-safe id derived from a dealer group name."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+    return slug or "group"
+
+
+def _seed_dealer_groups_if_missing() -> None:
+    """Copy the onboarding CSV to dealer_groups.csv the first time the app runs."""
+    if _DEALER_GROUPS_CSV_PATH.is_file():
+        return
+    if _SEED_DEALER_GROUPS_CSV_PATH.is_file():
+        shutil.copyfile(_SEED_DEALER_GROUPS_CSV_PATH, _DEALER_GROUPS_CSV_PATH)
+    else:
+        with open(_DEALER_GROUPS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(_DEALER_GROUPS_CSV_HEADER)
+
+
+def load_dealer_groups() -> list[dict[str, str]]:
+    """Read the persisted dealer group registry: [{"id", "name", "store_filter"}, ...]."""
+    _seed_dealer_groups_if_missing()
+    groups: list[dict[str, str]] = []
+    seen_ids: dict[str, int] = {}
+
+    if not _DEALER_GROUPS_CSV_PATH.is_file():
+        return groups
+
+    with open(_DEALER_GROUPS_CSV_PATH, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = (row.get("Dealer Group") or "").strip()
+            if not name:
+                continue
+            store_filter = (row.get("Dealer Filters") or "").strip()
+            base_id = _slugify_group_id(name)
+            n = seen_ids.get(base_id, 0)
+            seen_ids[base_id] = n + 1
+            gid = base_id if n == 0 else f"{base_id}_{n + 1}"
+            groups.append({"id": gid, "name": name, "store_filter": store_filter})
+
+    return groups
+
+
+def save_dealer_groups(rows: list[dict[str, str]]) -> None:
+    """Overwrite dealer_groups.csv with the given [{"name", "store_filter"}, ...] rows."""
+    with open(_DEALER_GROUPS_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(_DEALER_GROUPS_CSV_HEADER)
+        for row in rows:
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            writer.writerow([name, (row.get("store_filter") or "").strip()])
+
+
 def _build_email_html(
     greeting: str,
     body_paragraphs: list[str],
@@ -462,23 +523,14 @@ def _snapshot_upload(upload: Optional[object]) -> bytes:
         return upload.getvalue() if hasattr(upload, "getvalue") else b""
 
 
-def _next_group_id() -> int:
-    n = int(st.session_state.get("pp_next_group_id", 0)) + 1
-    st.session_state.pp_next_group_id = n
-    return n
-
-
 _RAMP_STATUS_OPTIONS = ["New Deployment", "Ramp Phase", "Steady State"]
 
+_MONTH_NAMES: list[str] = [calendar.month_name[m] for m in range(1, 13)]
 
-def _empty_group(gid: int) -> dict[str, Any]:
+
+def _default_runtime_state() -> dict[str, Any]:
     return {
-        "id": gid,
-        "group_name": "",
-        "period_start": date(2026, 5, 1),
-        "period_end": date(2026, 5, 15),
         "ib_only": False,
-        "store_filter": "",
         "ramp_status": "Steady State",
         "outbound_launch_date": "early 2026",
         "listened_lines": list(LISTENED_LINE_TYPE_OPTIONS),
@@ -490,73 +542,122 @@ def _empty_group(gid: int) -> dict[str, Any]:
 
 def _init_batch_session_state() -> None:
     st.session_state.setdefault("pp_reports", [])
-    st.session_state.setdefault("pp_next_group_id", 0)
-    if "pp_groups" not in st.session_state or not st.session_state.pp_groups:
-        gid = _next_group_id()
-        st.session_state.pp_groups = [_empty_group(gid)]
+    st.session_state.setdefault("pp_group_state", {})
 
 
-def _group_idx(gid: int) -> Optional[int]:
-    for i, g in enumerate(st.session_state.pp_groups):
-        if g["id"] == gid:
-            return i
-    return None
+def _group_state(gid: str) -> dict[str, Any]:
+    """Runtime (non-persisted) state for a registry group: uploads, ib_only, etc."""
+    states: dict[str, dict[str, Any]] = st.session_state.pp_group_state
+    if gid not in states:
+        states[gid] = _default_runtime_state()
+    return states[gid]
 
 
-def _init_group_widgets(g: dict[str, Any]) -> None:
-    gid = g["id"]
+_PERIOD_TYPE_OPTIONS = ["Full Month", "First Half (1st–15th)", "Second Half (16th–end)"]
+
+
+def _init_month_state() -> None:
+    today = date.today()
+    st.session_state.setdefault("pp_report_month_name", calendar.month_name[today.month])
+    st.session_state.setdefault("pp_report_year", today.year)
+    st.session_state.setdefault("pp_report_period_type", _PERIOD_TYPE_OPTIONS[0])
+
+
+def _render_month_control() -> tuple[date, date]:
+    """Single shared period picker (monthly or bi-weekly) used to derive period_start/period_end
+    for every group."""
+    _init_month_state()
+    st.subheader("Report Period")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.selectbox("Month", options=_MONTH_NAMES, key="pp_report_month_name")
+    with col2:
+        st.number_input(
+            "Year", min_value=2000, max_value=2100, step=1, format="%d", key="pp_report_year"
+        )
+    with col3:
+        st.selectbox(
+            "Period",
+            options=_PERIOD_TYPE_OPTIONS,
+            key="pp_report_period_type",
+            help="Full Month for monthly reports, or a half-month option for bi-weekly reports.",
+        )
+
+    month_num = _MONTH_NAMES.index(st.session_state.pp_report_month_name) + 1
+    year = int(st.session_state.pp_report_year)
+    last_day = calendar.monthrange(year, month_num)[1]
+    period_type = st.session_state.pp_report_period_type
+
+    if period_type == "First Half (1st–15th)":
+        period_start = date(year, month_num, 1)
+        period_end = date(year, month_num, min(15, last_day))
+    elif period_type == "Second Half (16th–end)":
+        period_start = date(year, month_num, min(16, last_day))
+        period_end = date(year, month_num, last_day)
+    else:
+        period_start = date(year, month_num, 1)
+        period_end = date(year, month_num, last_day)
+
+    st.caption(
+        f"All selected dealer groups below will be generated for "
+        f"**{period_start.strftime('%B %-d')} – {period_end.strftime('%-d, %Y')}**."
+    )
+    return period_start, period_end
+
+
+def _init_group_widgets(gid: str) -> None:
+    gs = _group_state(gid)
+    st.session_state.setdefault(f"pp_g{gid}_selected", True)
     defaults: dict[str, Any] = {
-        f"pp_g{gid}_group_name": g.get("group_name", ""),
-        f"pp_g{gid}_period_start": g.get("period_start", date(2026, 5, 1)),
-        f"pp_g{gid}_period_end": g.get("period_end", date(2026, 5, 15)),
-        f"pp_g{gid}_ib_only": g.get("ib_only", False),
-        f"pp_g{gid}_store_filter": g.get("store_filter", ""),
-        f"pp_g{gid}_ramp_status": g.get("ramp_status", "Steady State"),
-        f"pp_g{gid}_outbound_launch_date": g.get("outbound_launch_date", "early 2026"),
-        f"pp_g{gid}_listened_lines": g.get("listened_lines", list(LISTENED_LINE_TYPE_OPTIONS)),
+        f"pp_g{gid}_ib_only": gs.get("ib_only", False),
+        f"pp_g{gid}_ramp_status": gs.get("ramp_status", "Steady State"),
+        f"pp_g{gid}_outbound_launch_date": gs.get("outbound_launch_date", "early 2026"),
+        f"pp_g{gid}_listened_lines": gs.get("listened_lines", list(LISTENED_LINE_TYPE_OPTIONS)),
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-def _on_upload_change(gid: int, blob_field: str, widget_key: str) -> None:
-    idx = _group_idx(gid)
-    if idx is None:
-        return
+def _on_upload_change(gid: str, blob_field: str, widget_key: str) -> None:
     upload = st.session_state.get(widget_key)
-    st.session_state.pp_groups[idx][blob_field] = _snapshot_upload(upload)
+    _group_state(gid)[blob_field] = _snapshot_upload(upload)
 
 
-def _read_group_inputs(g: dict[str, Any]) -> dict[str, Any]:
-    gid = g["id"]
+def _read_group_inputs(group: dict[str, str], period_start: date, period_end: date) -> dict[str, Any]:
+    gid = group["id"]
+    gs = _group_state(gid)
     ib_upload = st.session_state.get(f"pp_g{gid}_ib_csv")
     ob_upload = st.session_state.get(f"pp_g{gid}_ob_csv")
     dept_upload = st.session_state.get(f"pp_g{gid}_dept_csv")
     ib_only = bool(st.session_state.get(f"pp_g{gid}_ib_only", False))
 
-    ib_blob = _snapshot_upload(ib_upload) if ib_upload is not None else g.get("ib_blob", b"")
-    dept_blob = _snapshot_upload(dept_upload) if dept_upload is not None else g.get("dept_blob", b"")
+    ib_blob = _snapshot_upload(ib_upload) if ib_upload is not None else gs.get("ib_blob", b"")
+    dept_blob = _snapshot_upload(dept_upload) if dept_upload is not None else gs.get("dept_blob", b"")
     ob_blob = b""
     if not ib_only:
-        ob_blob = _snapshot_upload(ob_upload) if ob_upload is not None else g.get("ob_blob", b"")
+        ob_blob = _snapshot_upload(ob_upload) if ob_upload is not None else gs.get("ob_blob", b"")
 
-    idx = _group_idx(gid)
-    if idx is not None:
-        st.session_state.pp_groups[idx]["ib_blob"] = ib_blob
-        st.session_state.pp_groups[idx]["dept_blob"] = dept_blob
-        st.session_state.pp_groups[idx]["ob_blob"] = ob_blob
+    gs["ib_blob"] = ib_blob
+    gs["dept_blob"] = dept_blob
+    gs["ob_blob"] = ob_blob
+    gs["ib_only"] = ib_only
+    gs["ramp_status"] = str(st.session_state.get(f"pp_g{gid}_ramp_status", "Steady State"))
+    gs["outbound_launch_date"] = str(
+        st.session_state.get(f"pp_g{gid}_outbound_launch_date", "early 2026")
+    )
+    gs["listened_lines"] = list(st.session_state.get(f"pp_g{gid}_listened_lines", []))
 
     return {
         "id": gid,
-        "group_name": str(st.session_state.get(f"pp_g{gid}_group_name", "")).strip(),
-        "period_start": st.session_state.get(f"pp_g{gid}_period_start"),
-        "period_end": st.session_state.get(f"pp_g{gid}_period_end"),
+        "group_name": group["name"],
+        "period_start": period_start,
+        "period_end": period_end,
         "ib_only": ib_only,
-        "store_filter_raw": str(st.session_state.get(f"pp_g{gid}_store_filter", "")),
-        "ramp_status": str(st.session_state.get(f"pp_g{gid}_ramp_status", "Steady State")),
-        "outbound_launch_date": str(st.session_state.get(f"pp_g{gid}_outbound_launch_date", "early 2026")),
-        "listened_lines": list(st.session_state.get(f"pp_g{gid}_listened_lines", [])),
+        "store_filter_raw": group.get("store_filter", ""),
+        "ramp_status": gs["ramp_status"],
+        "outbound_launch_date": gs["outbound_launch_date"],
+        "listened_lines": gs["listened_lines"],
         "ib_blob": ib_blob,
         "ob_blob": ob_blob,
         "dept_blob": dept_blob,
@@ -737,10 +838,14 @@ def _generate_one_group(cfg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_batch() -> None:
-    groups = st.session_state.pp_groups
+def _is_group_selected(gid: str) -> bool:
+    return bool(st.session_state.get(f"pp_g{gid}_selected", True))
+
+
+def _run_batch(registry: list[dict[str, str]], period_start: date, period_end: date) -> None:
+    groups = [g for g in registry if _is_group_selected(g["id"])]
     if not groups:
-        st.error("Add at least one dealer group.")
+        st.error("Select at least one dealer group to generate reports for.")
         return
 
     st.session_state.pp_reports = []
@@ -748,7 +853,7 @@ def _run_batch() -> None:
     total = len(groups)
 
     for i, g in enumerate(groups):
-        cfg = _read_group_inputs(g)
+        cfg = _read_group_inputs(g, period_start, period_end)
         display_name = cfg["group_name"] or f"Group {cfg['id']}"
         progress.progress(i / total, text=f"Processing {display_name} ({i + 1} of {total})…")
 
@@ -774,38 +879,29 @@ def _run_batch() -> None:
     progress.progress(1.0, text="Batch generation complete.")
 
 
-def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
-    gid = g["id"]
-    _init_group_widgets(g)
+def _render_group_card(group: dict[str, str]) -> None:
+    gid = group["id"]
+    name = group["name"]
+    _init_group_widgets(gid)
+    gs = _group_state(gid)
 
-    title = str(st.session_state.get(f"pp_g{gid}_group_name", "")).strip() or f"Group {idx + 1}"
-    with st.expander(title, expanded=True):
-        if can_remove:
-            if st.button("Remove group", key=f"pp_g{gid}_remove"):
-                st.session_state.pp_groups.pop(idx)
-                st.rerun()
+    selected = _is_group_selected(gid)
+    with st.expander(name, expanded=selected):
+        st.checkbox("Include in this run", key=f"pp_g{gid}_selected")
+        if not st.session_state.get(f"pp_g{gid}_selected", True):
+            st.caption("Excluded from this run — manage the group itself in the Dealer Groups tab.")
+            return
 
-        st.text_input("Dealer group name", key=f"pp_g{gid}_group_name")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.date_input("Period start", key=f"pp_g{gid}_period_start")
-        with c2:
-            st.date_input("Period end", key=f"pp_g{gid}_period_end")
+        store_filter_raw = (group.get("store_filter") or "").strip()
+        if store_filter_raw:
+            filters_preview = ", ".join(normalize_store_filters(store_filter_raw) or [])
+            st.caption(f"Dealer filters: {filters_preview}")
+        else:
+            st.caption("Dealer filters: none (all stores in this group are included)")
 
         st.checkbox(
             "Inbound-only report (no outbound metrics; hides Sales Dials column)",
             key=f"pp_g{gid}_ib_only",
-        )
-
-        st.text_area(
-            "Optional store filters (substring match; leave empty for all stores)",
-            key=f"pp_g{gid}_store_filter",
-            height=110,
-            placeholder="All Star\nGenesis Baton Rouge",
-            help=(
-                "One substring per line, or separate with commas or semicolons. "
-                "A store is included if its name matches any of these (OR)."
-            ),
         )
 
         rs_col, ld_col = st.columns(2)
@@ -865,11 +961,11 @@ def _render_group_card(g: dict[str, Any], idx: int, can_remove: bool) -> None:
             help='Select all line types that apply. All selected = "all your lines" in the report.',
         )
 
-        if g.get("ib_blob"):
+        if gs.get("ib_blob"):
             st.caption("Inbound CSV loaded.")
-        if g.get("dept_blob"):
+        if gs.get("dept_blob"):
             st.caption("Department CSV loaded.")
-        if g.get("ob_blob"):
+        if gs.get("ob_blob"):
             st.caption("Outbound CSV loaded.")
 
 
@@ -1050,34 +1146,124 @@ def _render_results() -> None:
                             st.error(f"Individual email send failed: {e}")
 
 
+def _render_dealer_groups_tab() -> None:
+    st.subheader("Manage Dealer Groups")
+    st.caption(
+        "Add, edit, or remove dealer groups here — they'll automatically show up in the "
+        "**Generate Reports** tab. Dealer Filters accept comma-, semicolon-, or newline-separated "
+        "dealer names (leave blank to include every store in the group). Click the "
+        "**+** row at the bottom to add a group, or the trash icon on a row to delete one."
+    )
+
+    registry = load_dealer_groups()
+    df = pd.DataFrame(
+        [{"Dealer Group": g["name"], "Dealer Filters": g["store_filter"]} for g in registry],
+        columns=["Dealer Group", "Dealer Filters"],
+    )
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pp_dealer_groups_editor",
+        column_config={
+            "Dealer Group": st.column_config.TextColumn(required=True),
+            "Dealer Filters": st.column_config.TextColumn(
+                help="Comma, semicolon, or newline-separated dealer names. Leave blank for all stores."
+            ),
+        },
+    )
+
+    rows = edited.fillna("").to_dict("records")
+    names = [str(r["Dealer Group"]).strip() for r in rows if str(r.get("Dealer Group", "")).strip()]
+
+    col_save, col_download = st.columns(2)
+    with col_save:
+        if st.button("Save changes", type="primary"):
+            if len(names) != len(set(names)):
+                st.error("Dealer group names must be unique. Fix duplicates and save again.")
+            else:
+                save_dealer_groups(
+                    [
+                        {"name": str(r["Dealer Group"]), "store_filter": str(r["Dealer Filters"])}
+                        for r in rows
+                        if str(r.get("Dealer Group", "")).strip()
+                    ]
+                )
+                st.success(f"Saved {len(names)} dealer group(s).")
+                st.rerun()
+    with col_download:
+        csv_buf = io.StringIO()
+        writer = csv.writer(csv_buf)
+        writer.writerow(_DEALER_GROUPS_CSV_HEADER)
+        for r in rows:
+            if str(r.get("Dealer Group", "")).strip():
+                writer.writerow([r["Dealer Group"], r["Dealer Filters"]])
+        st.download_button(
+            "Download dealer_groups.csv",
+            data=csv_buf.getvalue().encode("utf-8"),
+            file_name="dealer_groups.csv",
+            mime="text/csv",
+            help="Commit this file to the GitHub repo to make changes permanent across redeploys.",
+        )
+
+    st.info(
+        "This list is saved to `dealer_groups.csv` on the app's disk. On Streamlit Community Cloud "
+        "that disk resets on redeploy/restart, so download the CSV above and commit it to GitHub "
+        "whenever you want changes to stick permanently.",
+        icon="ℹ️",
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="PromptPath Executive Report", layout="centered")
     _ensure_password_gate()
     _maybe_sidebar_actions()
     st.title("PromptPath Executive Summary Report")
-    st.caption(
-        "Configure one or more dealer groups below, upload each group's CSVs, then click "
-        "**Generate All Reports**. Each group produces a recap .docx, a number audit Excel file "
-        "(_audit.xlsx), and a ZIP of individual dealer reports."
-    )
 
     _init_batch_session_state()
 
-    groups = st.session_state.pp_groups
-    for idx, g in enumerate(groups):
-        _render_group_card(g, idx, can_remove=len(groups) > 1)
+    tab_generate, tab_groups = st.tabs(["Generate Reports", "Dealer Groups"])
 
-    col_add, col_gen = st.columns([1, 2])
-    with col_add:
-        if st.button("+ Add Another Group"):
-            st.session_state.pp_groups.append(_empty_group(_next_group_id()))
-            st.rerun()
-    with col_gen:
-        if st.button("Generate All Reports", type="primary"):
-            _run_batch()
-            st.rerun()
+    with tab_generate:
+        st.caption(
+            "Set the report period once below (monthly or bi-weekly), choose which dealer groups "
+            "to include, upload each group's CSVs, then click **Generate Reports**. Each group "
+            "produces a recap .docx, a number audit Excel file (_audit.xlsx), and a ZIP of "
+            "individual dealer reports."
+        )
 
-    _render_results()
+        period_start, period_end = _render_month_control()
+        st.divider()
+
+        registry = load_dealer_groups()
+        if not registry:
+            st.warning("No dealer groups yet. Add some in the **Dealer Groups** tab first.")
+        else:
+            col_all, col_clear = st.columns(2)
+            with col_all:
+                if st.button("Generate Reports for All", type="primary"):
+                    for group in registry:
+                        st.session_state[f"pp_g{group['id']}_selected"] = True
+                    st.rerun()
+            with col_clear:
+                if st.button("Clear Selection"):
+                    for group in registry:
+                        st.session_state[f"pp_g{group['id']}_selected"] = False
+                    st.rerun()
+
+            for group in registry:
+                _render_group_card(group)
+
+            st.divider()
+            if st.button("Generate Reports", type="primary"):
+                _run_batch(registry, period_start, period_end)
+                st.rerun()
+
+        _render_results()
+
+    with tab_groups:
+        _render_dealer_groups_tab()
 
 
 if __name__ == "__main__":
