@@ -263,7 +263,6 @@ def generate_script(api_key: str, user_message: str, model: str = "gpt-5.5") -> 
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
-        temperature=0.4,
     )
     script = response.choices[0].message.content or ""
     return _expand_tts_abbreviations(script.strip())
