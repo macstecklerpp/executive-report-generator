@@ -126,6 +126,14 @@ OB_UNIQUE_OPP_COLUMNS = (
     "Unique Customers",
 )
 
+# "Manager View Rate" (Key Group Performance): store admin listened-to / reviewed-call percentage.
+STORE_ADMIN_VIEWED_COLUMNS = (
+    "Store Admin Viewed %",
+    "Store Admin Viewed",
+    "Admin Viewed %",
+    "Manager Viewed %",
+)
+
 
 def _first_matching_col(fieldnames: Optional[List[str]], candidates: tuple[str, ...]) -> Optional[str]:
     if not fieldnames:
@@ -243,6 +251,8 @@ class ReportData:
     ob_opp_col: Optional[str]
     ob_connected_col: str
     inbound_soft_col: bool
+    ib_admin_viewed_col: Optional[str] = None
+    ob_admin_viewed_col: Optional[str] = None
 
 
 # Canonical labels for Streamlit multiselect and DOCX sentence (single source of truth).
@@ -557,8 +567,7 @@ def pct_hard_of_hard_plus_soft(hard: int, soft: int) -> int:
 
 
 def fmt_appts_hard_line(total_appts: int, hard_appts: int, soft_appts: int) -> str:
-    hp = pct_hard_of_hard_plus_soft(hard_appts, soft_appts)
-    return f"{total_appts} ({hp}% hard)"
+    return f"{total_appts} ({hard_appts} hard, {soft_appts} soft)"
 
 
 def fs(c, calls):
@@ -570,6 +579,15 @@ def si(v):
         return int(float(str(v).strip()))
     except Exception:
         return 0
+
+
+def spct(v) -> Optional[float]:
+    """Parse a percentage field that may be a fraction (0.17) or a whole number (17)."""
+    try:
+        f = float(str(v).strip().rstrip("%"))
+    except Exception:
+        return None
+    return round(f * 100, 1) if abs(f) <= 1.5 else round(f, 1)
 
 
 def _validate_csv_columns(fieldnames: Optional[List[str]], required: tuple, label: str) -> None:
@@ -632,6 +650,7 @@ def load_report_data(config: ReportConfig) -> ReportData:
     inbound_soft_col = bool(ib and ib[0] is not None and "Soft Appt" in ib[0])
     _ib_fields = list(ib[0].keys()) if ib else []
     ib_opp_col = _first_matching_col(_ib_fields, IB_UNIQUE_OPP_COLUMNS) or "Connected"
+    ib_admin_viewed_col = _first_matching_col(_ib_fields, STORE_ADMIN_VIEWED_COLUMNS)
 
     dd: Dict[str, Dict[str, Any]] = {}
     for row in ib:
@@ -658,6 +677,8 @@ def load_report_data(config: ReportConfig) -> ReportData:
         d[px + "soft_appts"] = soft
         d[px + "delighted"] = si(row["Delighted"])
         d[px + "disappointed"] = si(row["Disappointed"])
+        if ib_admin_viewed_col:
+            d[px + "ib_admin_viewed_pct"] = spct(row.get(ib_admin_viewed_col))
 
     def _pib(row):
         if not row:
@@ -670,7 +691,7 @@ def load_report_data(config: ReportConfig) -> ReportData:
         else:
             soft = max(0, tot - hard)
         opp = si(row[ib_opp_col])
-        return {
+        res = {
             k: si(row[v])
             for k, v in [
                 ("ib_calls", "Inbound Calls"),
@@ -681,6 +702,9 @@ def load_report_data(config: ReportConfig) -> ReportData:
                 ("disappointed", "Disappointed"),
             ]
         } | {"soft_appts": soft, "ib_unique_opps": opp}
+        if ib_admin_viewed_col:
+            res["ib_admin_viewed_pct"] = spct(row.get(ib_admin_viewed_col))
+        return res
 
     ac = _pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
     ap = _pib(next((r for r in ib if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
@@ -693,6 +717,7 @@ def load_report_data(config: ReportConfig) -> ReportData:
     ob: List[Dict[str, str]] = []
     ob_opp_col: Optional[str] = None
     ob_connected_col = "Connected"
+    ob_admin_viewed_col: Optional[str] = None
     if not ib_only:
         if not config.ob_csv_path:
             raise ValueError("Outbound CSV path is required when ib_only is False.")
@@ -701,6 +726,7 @@ def load_report_data(config: ReportConfig) -> ReportData:
         _ob_fields = list(ob[0].keys()) if ob else []
         ob_connected_col = _resolve_ob_connected_column(_ob_fields) or "Connected"
         ob_opp_col = _first_matching_col(_ob_fields, OB_UNIQUE_OPP_COLUMNS) or ob_connected_col
+        ob_admin_viewed_col = _first_matching_col(_ob_fields, STORE_ADMIN_VIEWED_COLUMNS)
         for row in ob:
             dn = row["Dealerships"].strip()
             pe = row["Period"].strip()
@@ -718,13 +744,15 @@ def load_report_data(config: ReportConfig) -> ReportData:
             d[px + "ob_total_appts"] = h_ob + s_ob
             d[px + "ob_hard_appts"] = h_ob
             d[px + "ob_soft_appts"] = s_ob
+            if ob_admin_viewed_col:
+                d[px + "ob_admin_viewed_pct"] = spct(row.get(ob_admin_viewed_col))
 
         def _pob(row):
             if not row:
                 return {}
             h_ob = si(row["Hard Appt"])
             s_ob = si(row["Soft Appt"])
-            return {
+            res = {
                 "ob_dials": si(row["Outbound Dials"]),
                 "ob_connected": si(row[ob_connected_col]),
                 "ob_unique_opps": si(row[ob_opp_col]),
@@ -732,6 +760,9 @@ def load_report_data(config: ReportConfig) -> ReportData:
                 "ob_hard_appts": h_ob,
                 "ob_soft_appts": s_ob,
             }
+            if ob_admin_viewed_col:
+                res["ob_admin_viewed_pct"] = spct(row.get(ob_admin_viewed_col))
+            return res
 
         oc_d = _pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Current"), None))
         op_d = _pob(next((r for r in ob if r["Dealerships"] == "All Dealers" and r["Period"] == "Previous"), None))
@@ -752,6 +783,8 @@ def load_report_data(config: ReportConfig) -> ReportData:
         ib=ib, ob=ob, ib_opp_col=ib_opp_col,
         ob_opp_col=ob_opp_col, ob_connected_col=ob_connected_col,
         inbound_soft_col=inbound_soft_col,
+        ib_admin_viewed_col=ib_admin_viewed_col,
+        ob_admin_viewed_col=ob_admin_viewed_col,
     )
 
 
@@ -795,6 +828,11 @@ def generate_report(config: ReportConfig) -> str:
     # IS active, the All Dealers row reflects every store, not just the filtered
     # ones, so we sum the filtered sn list instead to correctly scope the rates.
     _kgp_sf = normalize_store_filters(config.store_filter)
+
+    def _avg_pct(vals):
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
     if not _kgp_sf:
         kgp_iu = ac.get("ib_unique_opps", 0)
         kgp_ia = ac.get("total_appts", 0)
@@ -804,6 +842,22 @@ def generate_report(config: ReportConfig) -> str:
         kgp_ota = oc_d.get("ob_total_appts", 0)
         kgp_ou_p = op_d.get("ob_connected", 0)
         kgp_ota_p = op_d.get("ob_total_appts", 0)
+        kgp_ic = ac.get("ib_calls", 0)
+        kgp_ic_p = ap.get("ib_calls", 0)
+        kgp_conn = ac.get("connected", 0)
+        kgp_conn_p = ap.get("connected", 0)
+        kgp_delighted = ac.get("delighted", 0)
+        kgp_delighted_p = ap.get("delighted", 0)
+        kgp_disappointed = ac.get("disappointed", 0)
+        kgp_disappointed_p = ap.get("disappointed", 0)
+        kgp_oo = oc_d.get("ob_unique_opps", 0)
+        kgp_oo_p = op_d.get("ob_unique_opps", 0)
+        kgp_ob_dials = oc_d.get("ob_dials", 0)
+        kgp_ob_dials_p = op_d.get("ob_dials", 0)
+        kgp_ib_avp = ac.get("ib_admin_viewed_pct")
+        kgp_ib_avp_p = ap.get("ib_admin_viewed_pct")
+        kgp_ob_avp = oc_d.get("ob_admin_viewed_pct")
+        kgp_ob_avp_p = op_d.get("ob_admin_viewed_pct")
     else:
         kgp_iu = sum(dd[n].get("curr_ib_unique_opps", 0) for n in sn)
         kgp_ia = sum(dd[n].get("curr_total_appts", 0) for n in sn)
@@ -813,6 +867,22 @@ def generate_report(config: ReportConfig) -> str:
         kgp_ota = sum(dd[n].get("curr_ob_total_appts", 0) for n in sn)
         kgp_ou_p = sum(dd[n].get("prev_ob_connected", 0) for n in sn)
         kgp_ota_p = sum(dd[n].get("prev_ob_total_appts", 0) for n in sn)
+        kgp_ic = sum(dd[n].get("curr_ib_calls", 0) for n in sn)
+        kgp_ic_p = sum(dd[n].get("prev_ib_calls", 0) for n in sn)
+        kgp_conn = sum(dd[n].get("curr_connected", 0) for n in sn)
+        kgp_conn_p = sum(dd[n].get("prev_connected", 0) for n in sn)
+        kgp_delighted = sum(dd[n].get("curr_delighted", 0) for n in sn)
+        kgp_delighted_p = sum(dd[n].get("prev_delighted", 0) for n in sn)
+        kgp_disappointed = sum(dd[n].get("curr_disappointed", 0) for n in sn)
+        kgp_disappointed_p = sum(dd[n].get("prev_disappointed", 0) for n in sn)
+        kgp_oo = sum(dd[n].get("curr_ob_unique_opps", 0) for n in sn)
+        kgp_oo_p = sum(dd[n].get("prev_ob_unique_opps", 0) for n in sn)
+        kgp_ob_dials = sum(dd[n].get("curr_ob_dials", 0) for n in sn)
+        kgp_ob_dials_p = sum(dd[n].get("prev_ob_dials", 0) for n in sn)
+        kgp_ib_avp = _avg_pct(dd[n].get("curr_ib_admin_viewed_pct") for n in sn)
+        kgp_ib_avp_p = _avg_pct(dd[n].get("prev_ib_admin_viewed_pct") for n in sn)
+        kgp_ob_avp = _avg_pct(dd[n].get("curr_ob_admin_viewed_pct") for n in sn)
+        kgp_ob_avp_p = _avg_pct(dd[n].get("prev_ob_admin_viewed_pct") for n in sn)
 
     ib = data.ib
     ob = data.ob
@@ -820,6 +890,8 @@ def generate_report(config: ReportConfig) -> str:
     ob_opp_col = data.ob_opp_col
     ob_connected_col = data.ob_connected_col
     inbound_soft_col = data.inbound_soft_col
+    ib_admin_viewed_col = data.ib_admin_viewed_col
+    ob_admin_viewed_col = data.ob_admin_viewed_col
 
     def build(mf, pf, df, hib=True):
         rows = []
@@ -892,9 +964,9 @@ def generate_report(config: ReportConfig) -> str:
         lambda d, p: f"{pct(d.get(p + 'connected', 0), d.get(p + 'ib_calls', 1))}%",
     )
     ib_b = [
-        ("IB Connect Rate", ibcr, "inbound"),
+        ("Connect Rate", ibcr, "inbound"),
         ("Opportunities", ibc, "inbound"),
-        ("Appts Set (% hard)", iba, "inbound"),
+        ("Appts Set (# hard, # soft)", iba, "inbound"),
         ("Appt Set Rate", ibr, "inbound"),
         ("Delighted Customers", ibd, "inbound"),
         ("Disappointed Customers", ibx, "inbound"),
@@ -931,7 +1003,7 @@ def generate_report(config: ReportConfig) -> str:
         ob_b = [
             ("Connect Rate", ocr, "outbound"),
             ("Opportunities", oco, "outbound"),
-            ("Appts Set (% hard)", oa, "outbound"),
+            ("Appts Set (# hard, # soft)", oa, "outbound"),
             ("Appt Set Rate", or_, "outbound"),
         ]
 
@@ -1033,6 +1105,16 @@ def generate_report(config: ReportConfig) -> str:
         lp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         lp.paragraph_format.space_before = Pt(0)
         lp.paragraph_format.space_after = Pt(0)
+        if not config.single_store_report:
+            # Group-level executive reports get a prominent PromptCast label up top;
+            # the user hyperlinks it to the actual PromptCast audio file in Word afterward.
+            pc_p = lp
+            pc_p.paragraph_format.space_after = Pt(2)
+            add_run(pc_p, "PromptCast", bold=True, size=13, color=BRAND_ORANGE)
+            lp = right.add_paragraph()
+            lp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            lp.paragraph_format.space_before = Pt(0)
+            lp.paragraph_format.space_after = Pt(0)
         lp.add_run().add_picture(config.logo_path, width=Inches(1.8))
         set_col_widths(t, [6400, 2960])
 
@@ -1146,14 +1228,59 @@ def generate_report(config: ReportConfig) -> str:
 
     def kgp(doc):
         section_heading(doc, "Key Group Performance", sb=14)
-        iu = kgp_iu
-        ia = kgp_ia
-        ir = pct_appt_rate(ia, iu)
-        pr = pct_appt_rate(kgp_ia_p, kgp_iu_p)
-        ic_ = round(ir - pr, 1)
-        ia_ = f"{'▲' if ic_ > 0 else '▼' if ic_ < 0 else '—'} {'+' if ic_ > 0 else ''}{ic_}pp" if ic_ != 0 else "—"
-        nr = 2 if ib_only else 3
-        t = doc.add_table(rows=nr, cols=3)
+
+        def pp_row(label, cur, prev):
+            val = fmt_appt_pct_label(cur)
+            if prev is None:
+                return label, val, "—", MID_GRAY
+            d = round(cur - prev, 1)
+            if d == 0:
+                return label, val, "—", MID_GRAY
+            chg = f"{'▲' if d > 0 else '▼'} {'+' if d > 0 else ''}{d}pp"
+            return label, val, chg, GREEN if d > 0 else RED
+
+        def cnt_row(label, cur, prev, hib=True):
+            chg, _ = dstr(cur, prev)
+            color = dcol(chg, hib) if chg != "—" else MID_GRAY
+            return label, f"{cur:,}", chg, color
+
+        def sentiment_row(label, cur, prev, calls, hib=True):
+            chg, _ = dstr(cur, prev)
+            color = dcol(chg, hib) if chg != "—" else MID_GRAY
+            val = f"{cur:,} ({pct(cur, calls or 1)}%)"
+            return label, val, chg, color
+
+        ir = pct_appt_rate(kgp_ia, kgp_iu)
+        pr = pct_appt_rate(kgp_ia_p, kgp_iu_p) if kgp_iu_p else None
+        icr = pct(kgp_conn, kgp_ic) if kgp_ic else 0
+        icr_p = pct(kgp_conn_p, kgp_ic_p) if kgp_ic_p else None
+
+        ib_rows = [
+            pp_row("IB Connect Rate", icr, icr_p),
+            cnt_row("IB Opportunities", kgp_iu, kgp_iu_p),
+            pp_row(f"IB Appt Set Rate  ({kgp_ia:,} appts / {kgp_iu:,} unique)", ir, pr),
+            sentiment_row("IB Delighted Customers", kgp_delighted, kgp_delighted_p, kgp_ic, hib=True),
+            sentiment_row("IB Disappointed Customers", kgp_disappointed, kgp_disappointed_p, kgp_ic, hib=False),
+        ]
+        if ib_admin_viewed_col and kgp_ib_avp is not None:
+            ib_rows.append(pp_row("IB Manager View Rate", kgp_ib_avp, kgp_ib_avp_p))
+
+        ob_rows = []
+        if not ib_only:
+            ocr = pct(kgp_ou, kgp_ob_dials) if kgp_ob_dials else 0
+            ocr_p = pct(kgp_ou_p, kgp_ob_dials_p) if kgp_ob_dials_p else None
+            otr = pct_appt_rate(kgp_ota, kgp_ou)
+            otr_p = pct_appt_rate(kgp_ota_p, kgp_ou_p) if kgp_ou_p else None
+            ob_rows = [
+                pp_row("OB Connect Rate", ocr, ocr_p),
+                cnt_row("OB Opportunities", kgp_oo, kgp_oo_p),
+                pp_row(f"OB Appt Set Rate  ({kgp_ota:,} appts / {kgp_ou:,} connected)", otr, otr_p),
+            ]
+            if ob_admin_viewed_col and kgp_ob_avp is not None:
+                ob_rows.append(pp_row("OB Manager View Rate", kgp_ob_avp, kgp_ob_avp_p))
+
+        all_rows = ib_rows + ob_rows
+        t = doc.add_table(rows=1 + len(all_rows), cols=3)
         t.style = "Table Grid"
         t.alignment = WD_TABLE_ALIGNMENT.LEFT
         for ci, h in enumerate(["METRIC", "MTD RATE", "CHANGE VS. PRIOR MTD"]):
@@ -1167,80 +1294,86 @@ def generate_report(config: ReportConfig) -> str:
                 color=WHITE,
                 align=WD_ALIGN_PARAGRAPH.LEFT if ci == 0 else WD_ALIGN_PARAGRAPH.CENTER,
             )
-        row = t.rows[1]
-        lbl = f"IB Appt Set Rate  ({ia:,} appts / {iu:,} unique)"
-        style_cell(row.cells[0], LIGHT_BLUE, BORDER_GRAY)
-        cell_para(row.cells[0], lbl, bold=True, size=9.5, color=BRAND_NAVY, align=WD_ALIGN_PARAGRAPH.LEFT)
-        style_cell(row.cells[1], LIGHT_BLUE, BORDER_GRAY)
-        cell_para(row.cells[1], fmt_appt_pct_label(ir), bold=True, size=11, color=BRAND_NAVY)
-        style_cell(row.cells[2], LIGHT_BLUE, BORDER_GRAY)
-        cell_para(row.cells[2], ia_, bold=True, size=10, color=GREEN if ic_ > 0 else (RED if ic_ < 0 else MID_GRAY))
-        if not ib_only:
-            ou = kgp_ou
-            ota = kgp_ota
-            otr = pct_appt_rate(ota, ou)
-            opr = pct_appt_rate(kgp_ota_p, kgp_ou_p)
-            oc_ = round(otr - opr, 1)
-            oa_ = f"{'▲' if oc_ > 0 else '▼' if oc_ < 0 else '—'} {'+' if oc_ > 0 else ''}{oc_}pp" if oc_ != 0 else "—"
-            row = t.rows[2]
-            olbl = f"OB Appt Set Rate  ({ota:,} appts / {ou:,} connected)"
-            style_cell(row.cells[0], ORANGE_LIGHT, BORDER_GRAY)
-            cell_para(row.cells[0], olbl, bold=True, size=9.5, color=BRAND_ORANGE, align=WD_ALIGN_PARAGRAPH.LEFT)
-            style_cell(row.cells[1], ORANGE_LIGHT, BORDER_GRAY)
-            cell_para(row.cells[1], fmt_appt_pct_label(otr), bold=True, size=11, color=BRAND_ORANGE)
-            style_cell(row.cells[2], ORANGE_LIGHT, BORDER_GRAY)
-            cell_para(row.cells[2], oa_, bold=True, size=10, color=GREEN if oc_ > 0 else (RED if oc_ < 0 else MID_GRAY))
+        for ri, (lbl, val, chg, color) in enumerate(all_rows):
+            is_ib = ri < len(ib_rows)
+            bg = LIGHT_BLUE if is_ib else ORANGE_LIGHT
+            fg = BRAND_NAVY if is_ib else BRAND_ORANGE
+            row = t.rows[1 + ri]
+            style_cell(row.cells[0], bg, BORDER_GRAY)
+            cell_para(row.cells[0], lbl, bold=True, size=9.5, color=fg, align=WD_ALIGN_PARAGRAPH.LEFT)
+            style_cell(row.cells[1], bg, BORDER_GRAY)
+            cell_para(row.cells[1], val, bold=True, size=11, color=fg)
+            style_cell(row.cells[2], bg, BORDER_GRAY)
+            cell_para(row.cells[2], chg, bold=True, size=10, color=color)
         _apply_cant_split(t)
         set_col_widths(t, [4320, 2520, 2520])
 
     def store_bundle(doc, name):
         store_heading(doc, name.upper())
-        mr = [(l, "inbound", next((r for r in b if r["name"] == name), None)) for l, b, _ in ib_b]
-        mr += [(l, "outbound", next((r for r in b if r["name"] == name), None)) for l, b, _ in ob_b]
-        mr = [(l, c, r) for l, c, r in mr if r]
+        ib_rows = [(l, next((r for r in b if r["name"] == name), None)) for l, b, _ in ib_b]
+        ib_rows = [(l, r) for l, r in ib_rows if r]
+        ob_rows = [(l, next((r for r in b if r["name"] == name), None)) for l, b, _ in ob_b]
+        ob_rows = [(l, r) for l, r in ob_rows if r]
         show_rank = ts > 1
-        headers = ["", "METRIC", "MTD", "CHANGE"] + (["RANK"] if show_rank else [])
-        alignments = (
-            [WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT]
-            + [WD_ALIGN_PARAGRAPH.CENTER] * (2 + (1 if show_rank else 0))
-        )
-        t = doc.add_table(rows=1 + len(mr), cols=len(headers))
+        headers = ["METRIC", "MTD", "CHANGE"] + (["RANK"] if show_rank else [])
+        alignments = [WD_ALIGN_PARAGRAPH.LEFT] + [WD_ALIGN_PARAGRAPH.CENTER] * (2 + (1 if show_rank else 0))
+        ncols = len(headers)
+        n_banners = (1 if ib_rows else 0) + (1 if ob_rows else 0)
+        t = doc.add_table(rows=1 + n_banners + len(ib_rows) + len(ob_rows), cols=ncols)
         t.style = "Table Grid"
         t.alignment = WD_TABLE_ALIGNMENT.LEFT
         for ci, (h, al) in enumerate(zip(headers, alignments)):
             c = t.rows[0].cells[ci]
             style_cell(c, BRAND_NAVY, BRAND_NAVY, top=65, bottom=65)
             cell_para(c, h, bold=True, size=8.5, color=WHITE, align=al)
-        for ri, (lbl, ch, sr) in enumerate(mr):
-            ib_row = ch == "inbound"
+
+        def banner_row(ri, label, bg, color):
+            row = t.rows[ri]
+            m = row.cells[0]
+            for i in range(1, ncols):
+                m = m.merge(row.cells[i])
+            style_cell(m, bg, BORDER_GRAY, top=55, bottom=55)
+            cell_para(m, label, bold=True, size=9, color=color)
+
+        def metric_row(ri, lbl, ib_row, sr):
             mb = IB_STRIPE if ib_row else OB_STRIPE
-            hb = LIGHT_BLUE if ib_row else ORANGE_LIGHT
-            cc = BRAND_NAVY if ib_row else BRAND_ORANGE
-            row = t.rows[1 + ri]
-            style_cell(row.cells[0], hb, BORDER_GRAY, top=55, bottom=55)
-            cell_para(row.cells[0], "I" if ib_row else "O", bold=True, size=8, color=cc)
+            row = t.rows[ri]
+            style_cell(row.cells[0], mb, BORDER_GRAY, top=55, bottom=55)
+            cell_para(row.cells[0], lbl, bold=True, size=9, color=GRAY, align=WD_ALIGN_PARAGRAPH.LEFT)
             style_cell(row.cells[1], mb, BORDER_GRAY, top=55, bottom=55)
-            cell_para(row.cells[1], lbl, bold=True, size=9, color=GRAY, align=WD_ALIGN_PARAGRAPH.LEFT)
+            cell_para(row.cells[1], sr["mtd"], bold=True, size=9.5, color=GRAY)
             style_cell(row.cells[2], mb, BORDER_GRAY, top=55, bottom=55)
-            cell_para(row.cells[2], sr["mtd"], bold=True, size=9.5, color=GRAY)
-            style_cell(row.cells[3], mb, BORDER_GRAY, top=55, bottom=55)
             chg = sr["change"]
             hib = sr.get("hib", True)
-            cell_para(row.cells[3], chg, size=9.5, color=dcol(chg, hib) if chg != "—" else MID_GRAY)
+            cell_para(row.cells[2], chg, size=9.5, color=dcol(chg, hib) if chg != "—" else MID_GRAY)
             if show_rank:
-                style_cell(row.cells[4], mb, BORDER_GRAY, top=55, bottom=55)
+                style_cell(row.cells[3], mb, BORDER_GRAY, top=55, bottom=55)
                 rank = sr.get("rank")
                 cell_para(
-                    row.cells[4],
+                    row.cells[3],
                     f"{rs(rank)} of {ts}" if rank else "—",
                     bold=bool(rank),
                     size=9,
                     color=rc(rank, ts) if rank else MID_GRAY,
                 )
+
+        ri = 1
+        if ib_rows:
+            banner_row(ri, "INBOUND", LIGHT_BLUE, BRAND_NAVY)
+            ri += 1
+            for lbl, sr in ib_rows:
+                metric_row(ri, lbl, True, sr)
+                ri += 1
+        if ob_rows:
+            banner_row(ri, "OUTBOUND", ORANGE_LIGHT, BRAND_ORANGE)
+            ri += 1
+            for lbl, sr in ob_rows:
+                metric_row(ri, lbl, False, sr)
+                ri += 1
         _apply_cant_split(t)
         set_col_widths(
             t,
-            [400, 5040, 1800, 1440, 1160] if show_rank else [400, 6200, 1800, 1440],
+            [5440, 1800, 1440, 1160] if show_rank else [6600, 1800, 1440],
         )
 
     doc = Document()
